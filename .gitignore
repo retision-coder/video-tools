@@ -1,0 +1,22 @@
+# 构建产物（不进 git；安装包通过 Release 资产分发）
+.venv/
+build/
+build_setup/
+dist/
+installer/
+__pycache__/
+*.spec
+*.pyc
+
+# 测试中间产物
+mock_server/
+batch_out/
+install.log
+setup_crash.log
+test_out*.mp4
+test_v*.mp4
+test_installed*.mp4
+test_final*.mp4
+
+# 用户配置
+watermark_schemes.json

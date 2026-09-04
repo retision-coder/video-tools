@@ -1,0 +1,8 @@
+# 运行依赖
+PyQt5>=5.15
+opencv-contrib-python-headless>=4.8
+imageio-ffmpeg>=0.5
+pywin32>=306  # 仅安装程序创建快捷方式需要
+
+# 打包依赖（仅构建 exe 时需要）
+pyinstaller>=6.0
