@@ -3,8 +3,11 @@
 方案保存/套用/删除 + 分辨率缩放 + 批量处理对话框全流程。"""
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 隔离配置目录，避免读写真实 %APPDATA% 下用户已保存的方案
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="wme_test_")
 
 import main
 from PyQt5.QtWidgets import QApplication, QMessageBox, QInputDialog
@@ -18,7 +21,7 @@ QInputDialog.getText = staticmethod(lambda *a, **k: ("测试方案A", True))
 
 orig_exec = QApplication.exec_
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SCHEME_FILE = os.path.join(APP_DIR, "watermark_schemes.json")
+SCHEME_FILE = main.SCHEMES_PATH
 BATCH_DIR = os.path.join(APP_DIR, "batch_out")
 
 

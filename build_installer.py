@@ -6,7 +6,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_EXE = os.path.join(HERE, "dist", "视频水印擦除工具.exe")
-OUT_NAME = "视频水印擦除工具_Setup_v1.4.1"
+OUT_NAME = "视频水印擦除工具_Setup_v1.4.2"
 
 if not os.path.isfile(APP_EXE):
     sys.exit("请先运行 build.py 生成主程序 exe")

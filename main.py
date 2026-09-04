@@ -28,7 +28,7 @@ import threading
 import urllib.request
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 # 在线升级：GitHub Releases
 UPDATE_REPO = "retision-coder/video-tools"
@@ -43,10 +43,12 @@ VIDEO_FILTER = ("视频文件 (" + " ".join("*" + e for e in VIDEO_EXTS) +
 # 水印样式 -> 处理模式
 STYLE_MODES = [
     ("文字 / Logo / 台标（智能修复，与周边融合）", "inpaint"),
+    ("AI 精修（LaMa 大模型，最干净，较慢）", "inpaint_ai"),
     ("半透明水印（高斯模糊）", "blur"),
     ("复杂背景水印（马赛克）", "mosaic"),
 ]
-MODE_NAMES = {"inpaint": "智能修复", "blur": "高斯模糊", "mosaic": "马赛克"}
+MODE_NAMES = {"inpaint": "智能修复", "inpaint_ai": "AI精修",
+              "blur": "高斯模糊", "mosaic": "马赛克"}
 MODE_ALIASES = {"delogo": "inpaint"}  # 兼容旧命令行
 
 PRESETS = [
@@ -396,8 +398,8 @@ def run_batch(ffmpeg, files, outdir, regions, ref_size,
             if overall_cb:
                 overall_cb(min(99, int((i + p / 100.0) / n * 100)))
 
-        ok, msg = process_video(ffmpeg, path, outp, scaled,
-                                progress_cb=cb, cancel=cancel)
+        ok, msg = process_video_auto(ffmpeg, path, outp, scaled,
+                                     progress_cb=cb, cancel=cancel)
         results.append((path, ok, msg))
         if file_cb:
             file_cb(path, ok, msg)
@@ -485,6 +487,208 @@ def build_update_bat(setup_path, instdir, app_exe):
 
 
 # ---------------------------------------------------------------------------
+# AI 精修组件（LaMa，按需下载，离线运行，无需 token）
+# ---------------------------------------------------------------------------
+
+UV_URL = ("https://github.com/astral-sh/uv/releases/latest/download/"
+          "uv-x86_64-pc-windows-msvc.zip")
+
+
+def ai_component_dir():
+    return os.path.join(config_dir(), "ai")
+
+
+def ai_python():
+    p = os.path.join(ai_component_dir(), "venv", "Scripts", "python.exe")
+    return p if os.path.isfile(p) else None
+
+
+def ai_ready():
+    p = ai_python()
+    if not p:
+        return False
+    try:
+        r = subprocess.run(
+            [p, "-c", "import simple_lama_inpainting, cv2, PIL"],
+            capture_output=True, timeout=120, creationflags=_CREATE_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_ai_component(log=print, cancel=None):
+    """按需下载并安装 AI 组件：uv → 独立 Python → torch + LaMa。
+    返回 AI 环境的 python 路径；失败抛异常。"""
+    import zipfile
+    adir = ai_component_dir()
+    os.makedirs(adir, exist_ok=True)
+    uv = os.path.join(adir, "uv.exe")
+    if cancel is not None and cancel.is_set():
+        raise RuntimeError("已取消")
+    if not os.path.isfile(uv):
+        log("① 下载 uv 安装工具（约 40MB）…")
+        tmp = os.path.join(adir, "uv.zip")
+        download_file(UV_URL, tmp)
+        with zipfile.ZipFile(tmp) as z:
+            for n in z.namelist():
+                if n.replace("\\", "/").endswith("uv.exe"):
+                    src = z.extract(n, adir)
+                    shutil.move(src, uv)
+                    break
+        os.remove(tmp)
+        # 清理 zip 里的中间目录
+        for d in os.listdir(adir):
+            dp = os.path.join(adir, d)
+            if os.path.isdir(dp) and d != "venv":
+                shutil.rmtree(dp, ignore_errors=True)
+    vdir = os.path.join(adir, "venv")
+    py = os.path.join(vdir, "Scripts", "python.exe")
+    if cancel is not None and cancel.is_set():
+        raise RuntimeError("已取消")
+    if not os.path.isfile(py):
+        log("② 安装独立 Python 运行环境…")
+        r = subprocess.run([uv, "venv", "--python", "3.11", vdir],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           creationflags=_CREATE_NO_WINDOW)
+        if r.returncode != 0 or not os.path.isfile(py):
+            raise RuntimeError("Python 环境安装失败：" + (r.stderr or "")[-300:])
+    if cancel is not None and cancel.is_set():
+        raise RuntimeError("已取消")
+    if not ai_ready():
+        log("③ 下载 AI 组件（PyTorch + LaMa，约 1GB，请耐心等候）…")
+        pkgs = ["simple-lama-inpainting", "opencv-contrib-python-headless"]
+        r = subprocess.run(
+            [uv, "pip", "install", "--python", py] + pkgs,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            creationflags=_CREATE_NO_WINDOW)
+        if r.returncode != 0:
+            # 默认 PyPI 失败/过慢时回退到清华镜像（国内网络更快）
+            log("默认源较慢，切换到国内镜像重试…")
+            r = subprocess.run(
+                [uv, "pip", "install", "--python", py,
+                 "--index-url", "https://pypi.tuna.tsinghua.edu.cn/simple"] + pkgs,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=_CREATE_NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("AI 组件安装失败：" + (r.stderr or "")[-300:])
+    if not ai_ready():
+        raise RuntimeError("AI 组件校验失败，请重试")
+    log("AI 组件就绪")
+    return py
+
+
+def engine_script():
+    if getattr(sys, "frozen", False):
+        src = os.path.join(sys._MEIPASS, "ai_engine.py")
+        # 不能直接在 _MEIPASS 里运行：脚本所在目录会成为子进程 sys.path[0]，
+        # _MEIPASS 里打包版自带的 3.12 版 _ctypes.pyd 会污染 AI 环境导致
+        # "python312.dll conflicts" 错误。复制到干净目录再运行。
+        dst = os.path.join(config_dir(), "ai_engine_runtime.py")
+        try:
+            if (not os.path.isfile(dst)
+                    or os.path.getsize(dst) != os.path.getsize(src)):
+                shutil.copy2(src, dst)
+        except Exception:
+            return src
+        return dst
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "ai_engine.py")
+
+
+def process_video_ai(ffmpeg, inp, outp, regions,
+                     progress_cb=None, cancel=None, status_cb=None):
+    """用 AI 组件环境逐帧处理（含 LaMa 精修）。返回 (ok, msg)。"""
+    py = ai_python()
+    if not py:
+        return False, "AI 组件未安装"
+    fd, rj = tempfile.mkstemp(suffix=".json", prefix="wme_regions_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(regions, f)
+        cmd = [py, engine_script(), "--input", inp, "--output", outp,
+               "--regions", rj, "--ffmpeg", ffmpeg]
+        # PyInstaller onefile 会把 _MEIPASS 注入 PATH，子进程（AI venv 的
+        # python 3.11）会因此误加载打包版自带的 python312.dll 等 DLL 而崩溃。
+        # 直接给子进程换成最小安全 PATH。
+        env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            sysroot = env.get("SystemRoot", r"C:\Windows")
+            env["PATH"] = os.pathsep.join([
+                os.path.dirname(py),
+                os.path.join(sysroot, "System32"), sysroot])
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONHOME", None)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=env, creationflags=_CREATE_NO_WINDOW)
+        except Exception as e:
+            return False, f"无法启动 AI 引擎：{e}"
+        err_lines = []
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line == "MODEL_LOADING" and status_cb:
+                    status_cb("正在加载 LaMa 模型（首次会自动下载约 200MB）…")
+                elif line == "MODEL_READY" and status_cb:
+                    status_cb("模型就绪，逐帧 AI 修复中（较慢属正常）…")
+                elif line.startswith("PROGRESS ") and progress_cb:
+                    _, i, n = line.split()
+                    i, n = int(i), int(n)
+                    if n > 0:
+                        progress_cb(min(99, int(i / n * 100)))
+                elif line.startswith("ERROR"):
+                    err_lines.append(line)
+                elif line and not line.startswith("PROGRESS"):
+                    err_lines.append(line)  # 保留引擎其它输出便于诊断
+                    del err_lines[:-12]
+                if cancel is not None and cancel.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+                    return False, "已取消"
+            proc.wait()
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False, f"AI 处理中断：{e}"
+        if proc.returncode == 0 and os.path.isfile(outp) \
+                and os.path.getsize(outp) > 0:
+            if progress_cb:
+                progress_cb(100)
+            return True, outp
+        return False, "AI 处理失败\n" + "\n".join(err_lines[-5:])
+    finally:
+        try:
+            os.remove(rj)
+        except OSError:
+            pass
+
+
+def has_ai_region(regions):
+    return any(r.get("mode") == "inpaint_ai" for r in regions)
+
+
+def process_video_auto(ffmpeg, inp, outp, regions,
+                       progress_cb=None, cancel=None, status_cb=None):
+    """按区域模式自动路由：含 AI 精修时走 LaMa 引擎，否则走本地快速算法。"""
+    if has_ai_region(regions):
+        return process_video_ai(ffmpeg, inp, outp, regions,
+                                progress_cb=progress_cb, cancel=cancel,
+                                status_cb=status_cb)
+    return process_video(ffmpeg, inp, outp, regions,
+                         progress_cb=progress_cb, cancel=cancel)
+
+
+# ---------------------------------------------------------------------------
 # CLI 模式
 # ---------------------------------------------------------------------------
 
@@ -504,7 +708,7 @@ def cli_main(args):
         mode = parts[4] if len(parts) >= 5 else args.mode
         mode = MODE_ALIASES.get(mode, mode)
         if mode not in MODE_NAMES:
-            print(f"错误：未知模式 {mode}（可选 inpaint/blur/mosaic）")
+            print(f"错误：未知模式 {mode}（可选 inpaint/blur/mosaic/inpaint_ai）")
             return 2
         t0 = float(parts[5]) if len(parts) >= 7 else 0.0
         t1 = float(parts[6]) if len(parts) >= 7 else None
@@ -517,7 +721,16 @@ def cli_main(args):
     def cb(p):
         print(f"\r进度 {p}%", end="", flush=True)
 
-    ok, msg = process_video(ffmpeg, args.input, args.output, regions, cb)
+    if has_ai_region(regions) and not ai_ready():
+        print("错误：所选模式包含 AI 精修，但 AI 组件尚未安装。")
+        print("请先打开图形界面，在框选样式中选择「AI 精修」并按提示下载组件（约 1GB，仅首次需要）。")
+        return 3
+
+    def status_cb(s):
+        print(f"\n{s}", flush=True)
+
+    ok, msg = process_video_auto(ffmpeg, args.input, args.output, regions,
+                                 progress_cb=cb, status_cb=status_cb)
     print()
     if ok:
         print(f"完成：{msg}")
@@ -537,7 +750,8 @@ def gui_main():
     from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog,
                                  QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                  QLineEdit, QListWidget, QMainWindow,
-                                 QMessageBox, QProgressBar, QPushButton,
+                                 QMessageBox, QProgressBar, QProgressDialog,
+                                 QPushButton,
                                  QSlider, QSplitter, QVBoxLayout, QWidget)
 
     HANDLE = 8  # 角手柄命中半径（控件像素）
@@ -751,6 +965,7 @@ def gui_main():
 
     class ProcessThread(QThread):
         progress = pyqtSignal(int)
+        status = pyqtSignal(str)
         finished_ = pyqtSignal(bool, str)
 
         def __init__(self, ffmpeg, inp, outp, regions):
@@ -759,9 +974,10 @@ def gui_main():
             self.cancel_ev = threading.Event()
 
         def run(self):
-            ok, msg = process_video(*self.args,
-                                    progress_cb=self.progress.emit,
-                                    cancel=self.cancel_ev)
+            ok, msg = process_video_auto(*self.args,
+                                         progress_cb=self.progress.emit,
+                                         cancel=self.cancel_ev,
+                                         status_cb=self.status.emit)
             self.finished_.emit(ok, msg)
 
     class BatchWorker(QThread):
@@ -883,6 +1099,13 @@ def gui_main():
             if not files:
                 QMessageBox.warning(self, APP_NAME, "请先添加视频文件")
                 return
+            if has_ai_region(self.regions) and not ai_ready():
+                QMessageBox.warning(
+                    self, APP_NAME,
+                    "方案中包含「AI 精修」样式，但 AI 组件尚未安装。\n"
+                    "请回到主界面单独处理一次并选择 AI 精修，"
+                    "按提示完成组件下载（约 1GB，仅首次需要）后再批量处理。")
+                return
             outdir = self.ed_dir.text().strip()
             if not outdir:
                 # 默认：第一个视频同级的"去水印输出"目录
@@ -932,6 +1155,8 @@ def gui_main():
         updateAuto = pyqtSignal(object, object)      # 后台自动检查结果
         dlProgress = pyqtSignal(int)                 # 后台下载进度
         dlDone = pyqtSignal(str, object)             # 后台下载完成 (path|"", err|None)
+        aiSetupLog = pyqtSignal(str)                 # AI 组件安装进度文字
+        aiSetupDone = pyqtSignal(object)             # AI 组件安装完成 (err str|None)
 
         def __init__(self):
             super().__init__()
@@ -961,6 +1186,8 @@ def gui_main():
             self.updateAuto.connect(self._on_auto_checked)
             self.dlProgress.connect(self._on_dl_progress)
             self.dlDone.connect(self._on_auto_downloaded)
+            self.aiSetupLog.connect(self._on_ai_setup_log)
+            self.aiSetupDone.connect(self._on_ai_setup_done)
             # 安装版启动 4 秒后在后台静默检查更新
             if getattr(sys, "frozen", False):
                 QTimer.singleShot(4000, self._auto_check)
@@ -1514,14 +1741,80 @@ def gui_main():
                 QMessageBox.warning(self, APP_NAME, f"输出目录不可写：{e}")
                 return
             regions = [dict(r) for r in self.regions]
+            if has_ai_region(regions) and not ai_ready():
+                r = QMessageBox.question(
+                    self, APP_NAME,
+                    "你选择了「AI 精修」样式。\n\n"
+                    "首次使用需要下载 AI 组件（PyTorch + LaMa 模型，约 1GB），"
+                    "只需下载一次，之后离线可用、不消耗任何 token。\n\n"
+                    "是否现在下载？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if r != QMessageBox.Yes:
+                    return
+                self._begin_ai_setup(regions, outp)
+                return
+            self._begin_process(regions, outp)
+
+        # ---------- AI 组件按需下载 ----------
+        def _begin_ai_setup(self, regions, outp):
+            self._ai_pending = (regions, outp)
+            self._ai_prog = QProgressDialog(
+                "正在准备 AI 组件…", "取消", 0, 0, self)
+            self._ai_prog.setWindowTitle(APP_NAME)
+            self._ai_prog.setWindowModality(Qt.WindowModal)
+            self._ai_prog.setMinimumDuration(0)
+            self._ai_prog.setValue(0)
+            self._ai_cancel = threading.Event()
+
+            def job():
+                err = None
+                try:
+                    ensure_ai_component(log=self.aiSetupLog.emit,
+                                        cancel=self._ai_cancel)
+                except Exception as e:
+                    err = str(e)
+                self.aiSetupDone.emit(err)
+
+            self._ai_prog.canceled.connect(self._ai_cancel.set)
+            threading.Thread(target=job, daemon=True).start()
+            self._ai_prog.show()
+
+        def _on_ai_setup_log(self, text):
+            self.lbl_status.setText(text)
+            if getattr(self, "_ai_prog", None):
+                self._ai_prog.setLabelText(text)
+
+        def _on_ai_setup_done(self, err):
+            if getattr(self, "_ai_prog", None):
+                self._ai_prog.close()
+                self._ai_prog = None
+            pending = getattr(self, "_ai_pending", None)
+            self._ai_pending = None
+            if err:
+                self.lbl_status.setText("AI 组件安装未完成")
+                if err != "已取消":
+                    QMessageBox.warning(
+                        self, APP_NAME,
+                        "AI 组件下载/安装失败：\n" + err +
+                        "\n\n请检查网络后重试（已下载的部分不会重复下载）。")
+                return
+            QMessageBox.information(self, APP_NAME,
+                                    "AI 组件安装完成，开始处理视频。")
+            if pending:
+                self._begin_process(*pending)
+
+        def _begin_process(self, regions, outp):
             self.worker = ProcessThread(self.ffmpeg, self.video_path, outp, regions)
             self.worker.progress.connect(self.progress.setValue)
+            self.worker.status.connect(self.lbl_status.setText)
             self.worker.finished_.connect(self._on_done)
             self._set_running(True)
             n_inpaint = sum(1 for r in regions if r["mode"] == "inpaint")
             tip = f"正在处理 {len(regions)} 个水印区域"
             if n_inpaint:
                 tip += "（含智能修复，速度较慢属正常）"
+            if has_ai_region(regions):
+                tip += "（AI 精修逐帧运行，速度较慢属正常）"
             self.lbl_status.setText(tip + "…")
             self.worker.start()
 
@@ -1784,7 +2077,8 @@ def main():
     parser.add_argument("--output", help="输出视频路径")
     parser.add_argument("--rect", action="append",
                         help="x,y,w,h[,mode[,t0,t1[,x1,y1]]]，可重复多次")
-    parser.add_argument("--mode", choices=["inpaint", "blur", "mosaic", "delogo"],
+    parser.add_argument("--mode", choices=["inpaint", "blur", "mosaic", "delogo",
+                                           "inpaint_ai"],
                         default="inpaint", help="默认擦除方式（rect 未指定时）")
     args = parser.parse_args()
     if args.cli:

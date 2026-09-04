@@ -16,6 +16,7 @@ cmd = [
     "--name", "视频水印擦除工具",
     f"--version-file={os.path.join(HERE, 'version_info.txt')}",
     f"--add-binary={FFMPEG};imageio_ffmpeg/binaries",
+    f"--add-data={os.path.join(HERE, 'ai_engine.py')};.",
     os.path.join(HERE, "main.py"),
 ]
 print("ffmpeg:", FFMPEG)

@@ -15,7 +15,7 @@ import sys
 import threading
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 APP_EXE = "视频水印擦除工具.exe"
 UNINST_EXE = "卸载.exe"
 REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\VideoWatermarkEraser"
@@ -26,6 +26,29 @@ _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 def default_install_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "Programs", "videotools")
+
+
+def existing_install():
+    """从注册表读取已安装版本的信息：(安装目录, 版本号)；未安装返回 None。"""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY) as k:
+            instdir, _ = winreg.QueryValueEx(k, "InstallLocation")
+            try:
+                ver, _ = winreg.QueryValueEx(k, "DisplayVersion")
+            except OSError:
+                ver = ""
+        if instdir and os.path.isfile(os.path.join(instdir, APP_EXE)):
+            return instdir, ver
+    except OSError:
+        pass
+    return None
+
+
+def preferred_install_dir():
+    """升级时默认装到现有安装目录；全新安装用默认目录。"""
+    ex = existing_install()
+    return ex[0] if ex else default_install_dir()
 
 
 def payload_path():
@@ -212,12 +235,20 @@ def gui_wizard():
             self.setFixedWidth(480)
             v = QVBoxLayout(self)
 
-            v.addWidget(QLabel(
-                f"<h3>欢迎使用 {APP_NAME} 安装向导</h3>"
-                "<p>将在你的电脑上安装视频水印擦除工具（无需管理员权限）。</p>"))
+            ex = existing_install()
+            if ex:
+                v.addWidget(QLabel(
+                    f"<h3>升级 {APP_NAME}</h3>"
+                    f"<p>检测到已安装 v{ex[1] or '未知版本'}（{ex[0]}），<br>"
+                    f"本次将覆盖升级到 <b>v{APP_VERSION}</b>，"
+                    "你的水印方案配置会保留。</p>"))
+            else:
+                v.addWidget(QLabel(
+                    f"<h3>欢迎使用 {APP_NAME} 安装向导</h3>"
+                    "<p>将在你的电脑上安装视频水印擦除工具（无需管理员权限）。</p>"))
             v.addWidget(QLabel("安装位置："))
             row = QHBoxLayout()
-            self.ed_dir = QLineEdit(default_install_dir())
+            self.ed_dir = QLineEdit(ex[0] if ex else default_install_dir())
             btn = QPushButton("浏览…")
             btn.clicked.connect(self._browse)
             row.addWidget(self.ed_dir, 1)
@@ -340,7 +371,7 @@ def main():
             return
 
         if silent:
-            instdir = instdir or default_install_dir()
+            instdir = instdir or preferred_install_dir()
             log_path = os.path.join(exe_dir, "install.log")
             lines = []
             try:
