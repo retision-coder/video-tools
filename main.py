@@ -708,8 +708,9 @@ def gui_main():
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            # 播放区域固定 540×960（720:1280 竖屏比例）
-            self.setFixedSize(540, 960)
+            # 播放区域固定 495×880（严格 720:1280 即 9:16 竖屏比例，
+            # 高度取最接近 888 的 16 的倍数，保证坐标映射无误差）
+            self.setFixedSize(495, 880)
             self.setAlignment(Qt.AlignCenter)
             self.setFocusPolicy(Qt.StrongFocus)
             self.setMouseTracking(True)

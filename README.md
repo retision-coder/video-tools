@@ -1,13 +1,13 @@
 # 视频水印擦除工具
 
-**📥 下载安装包：[视频水印擦除工具 v1.5.3 一键安装包（164MB，免联网免管理员）](https://github.com/retision-coder/video-tools/releases/latest)**
+**📥 下载安装包：[视频水印擦除工具 v1.5.4 一键安装包（164MB，免联网免管理员）](https://github.com/retision-coder/video-tools/releases/latest)**
 
 针对本地视频的水印擦除小工具（Windows）。
 支持**多个水印、每框独立样式、框大小调整、关键帧移动水印跟踪（帧级精度）、播放/暂停/停止/逐帧预览、方案复用、批量处理、后台自动更新**。
 
 ## 一键安装（推荐）
 
-双击 `installer/视频水印擦除工具_Setup_v1.5.3.exe`，向导一键安装
+双击 `installer/视频水印擦除工具_Setup_v1.5.4.exe`，向导一键安装
 （无需联网、无需管理员权限，默认装到 `%LOCALAPPDATA%\Programs\`）：
 
 - 自动创建桌面 + 开始菜单快捷方式
@@ -18,7 +18,7 @@
 静默安装（供以后在线升级 / 批量部署调用）：
 
 ```
-视频水印擦除工具_Setup_v1.5.3.exe /S /D=C:\安装目录
+视频水印擦除工具_Setup_v1.5.4.exe /S /D=C:\安装目录
 ```
 
 > 在线升级：主界面右下角「检查更新」→ 自动比对 GitHub Releases 最新版本 →
