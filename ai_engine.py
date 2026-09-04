@@ -22,22 +22,43 @@ def clamp_rect(x, y, w, h, vw, vh):
     return x, y, w, h
 
 
-def region_active(reg, t):
-    t0 = reg.get("t0", 0.0) or 0.0
+def norm_keys(reg):
+    """统一成关键帧列表 [(t, (x,y,w,h)), ...]，按时间排序（兼容旧格式）。"""
+    ks = reg.get("keys")
+    if ks:
+        out = [(float(k[0]), tuple(float(v) for v in k[1])) for k in ks]
+        out.sort(key=lambda e: e[0])
+        return out
+    r0 = tuple(float(v) for v in reg["r0"])
+    t0 = float(reg.get("t0") or 0.0)
     t1 = reg.get("t1")
-    return t >= t0 and (t1 is None or t <= t1)
+    r1 = reg.get("r1")
+    if t1 is not None:
+        end = tuple(float(v) for v in (r1 if r1 else reg["r0"]))
+        return [(t0, r0), (float(t1), end)]
+    return [(t0, r0)]
+
+
+def region_active(reg, t):
+    ks = norm_keys(reg)
+    if len(ks) == 1:
+        return t >= ks[0][0] - 1e-6
+    return ks[0][0] - 1e-6 <= t <= ks[-1][0] + 1e-6
 
 
 def rect_at(reg, t):
-    x, y, w, h = reg["r0"]
-    r1 = reg.get("r1")
-    t0 = reg.get("t0", 0.0) or 0.0
-    t1 = reg.get("t1")
-    if r1 and t1 is not None and t1 > t0:
-        k = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
-        return (x + (r1[0] - x) * k, y + (r1[1] - y) * k,
-                w + (r1[2] - w) * k, h + (r1[3] - h) * k)
-    return float(x), float(y), float(w), float(h)
+    ks = norm_keys(reg)
+    if len(ks) == 1 or t <= ks[0][0]:
+        return ks[0][1]
+    if t >= ks[-1][0]:
+        return ks[-1][1]
+    for i in range(len(ks) - 1):
+        t0, r0 = ks[i]
+        t1, r1 = ks[i + 1]
+        if t0 - 1e-9 <= t <= t1 + 1e-9:
+            k = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+            return tuple(a + (b - a) * k for a, b in zip(r0, r1))
+    return ks[-1][1]
 
 
 def apply_fast(frame, mode, x, y, w, h, cv2, np):

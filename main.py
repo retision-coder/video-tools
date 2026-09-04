@@ -28,7 +28,7 @@ import threading
 import urllib.request
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 
 # 在线升级：GitHub Releases
 UPDATE_REPO = "retision-coder/video-tools"
@@ -122,13 +122,20 @@ def scale_regions(regions, rw, rh, tw, th):
     if not rw or not rh or not tw or not th:
         return [dict(r) for r in regions]
     sx, sy = tw / rw, th / rh
+    f = (sx, sy, sx, sy)
     for r in regions:
+        if r.get("keys"):
+            out.append({"mode": r["mode"],
+                        "keys": [[float(k[0]),
+                                  [int(round(a * b)) for a, b in zip(k[1], f)]]
+                                 for k in r["keys"]]})
+            continue
         nr = dict(r)
         nr["r0"] = tuple(int(round(a * b))
-                         for a, b in zip(r["r0"], (sx, sy, sx, sy)))
+                         for a, b in zip(r["r0"], f))
         if r.get("r1"):
             nr["r1"] = tuple(int(round(a * b))
-                             for a, b in zip(r["r1"], (sx, sy, sx, sy)))
+                             for a, b in zip(r["r1"], f))
         out.append(nr)
     return out
 
@@ -213,23 +220,46 @@ def clamp_rect(x, y, w, h, vw, vh):
     return x, y, w, h
 
 
-def region_active(reg, t):
-    t0 = reg.get("t0", 0.0) or 0.0
+def norm_keys(reg):
+    """统一成关键帧列表 [(t, (x,y,w,h)), ...]，按时间排序。
+    兼容旧格式 r0/t0/t1/r1（等价于 1~2 个关键帧）。"""
+    ks = reg.get("keys")
+    if ks:
+        out = [(float(k[0]), tuple(float(v) for v in k[1])) for k in ks]
+        out.sort(key=lambda e: e[0])
+        return out
+    r0 = tuple(float(v) for v in reg["r0"])
+    t0 = float(reg.get("t0") or 0.0)
     t1 = reg.get("t1")
-    return t >= t0 and (t1 is None or t <= t1)
+    r1 = reg.get("r1")
+    if t1 is not None:
+        end = tuple(float(v) for v in (r1 if r1 else reg["r0"]))
+        return [(t0, r0), (float(t1), end)]
+    return [(t0, r0)]
+
+
+def region_active(reg, t):
+    """1 个关键帧：从该帧到结尾生效；≥2 个：首末关键帧之间生效。"""
+    ks = norm_keys(reg)
+    if len(ks) == 1:
+        return t >= ks[0][0] - 1e-6
+    return ks[0][0] - 1e-6 <= t <= ks[-1][0] + 1e-6
 
 
 def rect_at(reg, t):
-    """返回 t 时刻区域的 (x, y, w, h) 浮点值；支持线性移动。"""
-    x, y, w, h = reg["r0"]
-    r1 = reg.get("r1")
-    t0 = reg.get("t0", 0.0) or 0.0
-    t1 = reg.get("t1")
-    if r1 and t1 is not None and t1 > t0:
-        k = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
-        return (x + (r1[0] - x) * k, y + (r1[1] - y) * k,
-                w + (r1[2] - w) * k, h + (r1[3] - h) * k)
-    return float(x), float(y), float(w), float(h)
+    """t 时刻区域的 (x, y, w, h) 浮点值；相邻关键帧之间线性插值。"""
+    ks = norm_keys(reg)
+    if len(ks) == 1 or t <= ks[0][0]:
+        return ks[0][1]
+    if t >= ks[-1][0]:
+        return ks[-1][1]
+    for i in range(len(ks) - 1):
+        t0, r0 = ks[i]
+        t1, r1 = ks[i + 1]
+        if t0 - 1e-9 <= t <= t1 + 1e-9:
+            k = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+            return tuple(a + (b - a) * k for a, b in zip(r0, r1))
+    return ks[-1][1]
 
 
 def _apply_region(frame, mode, x, y, w, h):
@@ -758,11 +788,13 @@ def gui_main():
 
     class PreviewLabel(QLabel):
         """视频帧预览 + 多框交互（拖框/移动/四角缩放/删除）。
-        几何数据由主窗口下发：items = [(QRect, active:bool), ...]"""
+        几何数据由主窗口下发：items = [(QRect, active:bool), ...]；
+        ghosts = [(QRect, label), ...] 选中框的关键帧位置提示。"""
         rectDrawn = pyqtSignal(QRect)
         rectTransformed = pyqtSignal(int, QRect)
         selectionChanged = pyqtSignal(int)
         deleteRequested = pyqtSignal(int)
+        pauseRequested = pyqtSignal()
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -774,6 +806,7 @@ def gui_main():
             self.setText("请先选择视频文件")
             self._img = None
             self._items = []
+            self._ghosts = []
             self._sel = -1
             self._op = None    # ('draw',) ('move',i) ('resize',i,corner)
             self._anchor = QPoint()
@@ -787,6 +820,10 @@ def gui_main():
         def set_items(self, items, sel):
             self._items = [(QRect(r), a) for r, a in items]
             self._sel = sel
+            self.update()
+
+        def set_ghosts(self, ghosts):
+            self._ghosts = [(QRect(r), s) for r, s in ghosts]
             self.update()
 
         def _transform(self):
@@ -859,6 +896,16 @@ def gui_main():
                         p.drawRect(wp.x() - 3, wp.y() - 3, 6, 6)
                 p.setPen(QPen(QColor(255, 255, 255), 1))
                 p.drawText(dr.left() + 3, dr.top() + 14, f"#{i + 1}")
+            # 关键帧位置提示（选中框）：青色小虚线框 + 标注
+            for r, label in self._ghosts:
+                dr = QRect(int(ox + r.x() * scale), int(oy + r.y() * scale),
+                           max(2, int(r.width() * scale)),
+                           max(2, int(r.height() * scale)))
+                p.setPen(QPen(QColor(0, 220, 220), 1, Qt.DashLine))
+                p.setBrush(QColor(0, 220, 220, 25))
+                p.drawRect(dr)
+                p.setPen(QPen(QColor(0, 255, 255), 1))
+                p.drawText(dr.left() + 2, max(12, dr.top() - 4), label)
             if self._op and self._op[0] == "draw" and self._draft:
                 r = self._draft
                 dr = QRect(int(ox + r.x() * scale), int(oy + r.y() * scale),
@@ -873,6 +920,7 @@ def gui_main():
             if self._img is None:
                 return
             self.setFocus()
+            self.pauseRequested.emit()   # 拖动/框选时自动暂停播放
             if ev.button() == Qt.RightButton:
                 i = self._hit(self._to_video(ev.pos()))
                 if i >= 0:
@@ -1161,7 +1209,7 @@ def gui_main():
         def __init__(self):
             super().__init__()
             self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-            self.resize(1100, 700)
+            self.resize(1260, 1280)
             try:
                 self.ffmpeg = get_ffmpeg()
             except RuntimeError as e:
@@ -1173,8 +1221,14 @@ def gui_main():
             self._grabbing = False
             self._pending_t = 0.0
             self._cur_t = 0.0
+            # 播放/帧级定位（cv2 顺序读；失败时回退 ffmpeg 抽帧，禁用播放）
+            self._cap = None
+            self.fps = 25.0
+            self.total_frames = 0
+            self._cur_f = 0
+            self._playing = False
             self.worker = None
-            self.regions = []   # [{'mode','r0','t0','t1','r1'}]
+            self.regions = []   # [{'mode','keys':[(t,(x,y,w,h)),...]}]
             self._pending_update = None   # 已预下载完成的安装包路径
             self._auto_tag = None
             self._auto_body = ""
@@ -1188,6 +1242,8 @@ def gui_main():
             self.dlDone.connect(self._on_auto_downloaded)
             self.aiSetupLog.connect(self._on_ai_setup_log)
             self.aiSetupDone.connect(self._on_ai_setup_done)
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._play_tick)
             # 安装版启动 4 秒后在后台静默检查更新
             if getattr(sys, "frozen", False):
                 QTimer.singleShot(4000, self._auto_check)
@@ -1199,25 +1255,47 @@ def gui_main():
             self.preview.rectTransformed.connect(self._on_rect_transformed)
             self.preview.selectionChanged.connect(self._on_selection)
             self.preview.deleteRequested.connect(self._on_rect_deleted)
+            self.preview.pauseRequested.connect(self._pause)
 
             self.slider = QSlider(Qt.Horizontal)
             self.slider.setRange(0, 1000)
             self.slider.setEnabled(False)
             self.slider.valueChanged.connect(self._on_slider)
-            self.lbl_time = QLabel("00:00 / 00:00")
-            self.lbl_time.setMinimumWidth(110)
+            self.lbl_time = QLabel("00:00.00 / 00:00.00")
+            self.lbl_time.setMinimumWidth(230)
+
+            # 播放控制：停止 / 上一帧 / 播放暂停 / 下一帧
+            self.btn_stop = QPushButton("⏹ 停止")
+            self.btn_stop.clicked.connect(self._stop)
+            self.btn_prev = QPushButton("◀ 上一帧")
+            self.btn_prev.clicked.connect(lambda: self._step_frame(-1))
+            self.btn_play = QPushButton("▶ 播放")
+            self.btn_play.setMinimumWidth(90)
+            self.btn_play.clicked.connect(self._toggle_play)
+            self.btn_next = QPushButton("下一帧 ▶")
+            self.btn_next.clicked.connect(lambda: self._step_frame(1))
+            for b in (self.btn_stop, self.btn_prev, self.btn_play,
+                      self.btn_next):
+                b.setEnabled(False)
 
             left = QWidget()
             lv = QVBoxLayout(left)
             lv.setContentsMargins(6, 6, 6, 6)
             lv.addWidget(self.preview, 1)
+            trow = QHBoxLayout()
+            trow.addWidget(self.btn_stop)
+            trow.addWidget(self.btn_prev)
+            trow.addWidget(self.btn_play)
+            trow.addWidget(self.btn_next)
+            trow.addStretch(1)
+            lv.addLayout(trow)
             row = QHBoxLayout()
             row.addWidget(self.slider, 1)
             row.addWidget(self.lbl_time)
             lv.addLayout(row)
 
             right = QWidget()
-            right.setFixedWidth(340)
+            right.setFixedWidth(430)
             rv = QVBoxLayout(right)
             rv.setContentsMargins(8, 8, 8, 8)
 
@@ -1288,30 +1366,29 @@ def gui_main():
             self.cmb_style.currentIndexChanged.connect(self._on_style_changed)
             sv.addWidget(self.cmb_style)
 
-            trow = QHBoxLayout()
-            self.lbl_trange = QLabel("生效时间：全程")
-            trow.addWidget(self.lbl_trange, 1)
-            btn_t0 = QPushButton("当前帧→开始")
-            btn_t0.clicked.connect(self._set_t0)
-            btn_t1 = QPushButton("当前帧→结束")
-            btn_t1.clicked.connect(self._set_t1)
-            btn_tclr = QPushButton("全程")
-            btn_tclr.clicked.connect(self._clear_trange)
-            trow.addWidget(btn_t0)
-            trow.addWidget(btn_t1)
-            trow.addWidget(btn_tclr)
-            sv.addLayout(trow)
-
-            mrow = QHBoxLayout()
-            self.lbl_move = QLabel("移动水印：未启用")
-            mrow.addWidget(self.lbl_move, 1)
-            btn_r1clr = QPushButton("取消移动")
-            btn_r1clr.clicked.connect(self._clear_r1)
-            mrow.addWidget(btn_r1clr)
-            sv.addLayout(mrow)
-            tip2 = QLabel("移动水印用法：在开始处框好位置→「当前帧→开始」；"
-                          "拖时间轴到结束处→「当前帧→结束」→拖动红框对准"
-                          "新位置（自动记为结束位置，线性跟随移动）。")
+            self.lbl_keys = QLabel("关键帧：1 个（全程静止）")
+            self.lbl_keys.setWordWrap(True)
+            sv.addWidget(self.lbl_keys)
+            krow1 = QHBoxLayout()
+            btn_kstart = QPushButton("此处开始生效")
+            btn_kstart.clicked.connect(self._key_start_here)
+            btn_kend = QPushButton("此处结束生效")
+            btn_kend.clicked.connect(self._key_end_here)
+            krow1.addWidget(btn_kstart)
+            krow1.addWidget(btn_kend)
+            sv.addLayout(krow1)
+            krow2 = QHBoxLayout()
+            btn_kdel = QPushButton("删除此时关键帧")
+            btn_kdel.clicked.connect(self._del_key_here)
+            btn_kstatic = QPushButton("设为静止全程")
+            btn_kstatic.clicked.connect(self._make_static)
+            krow2.addWidget(btn_kdel)
+            krow2.addWidget(btn_kstatic)
+            sv.addLayout(krow2)
+            tip2 = QLabel("跟踪移动水印：播放/拖到水印移动后的位置，"
+                          "直接拖动红框对准，会自动在「当前这一帧」打关键帧"
+                          "（可打多个，框在相邻关键帧间线性移动）；"
+                          "青色虚线框 = 已有关键帧位置。")
             tip2.setWordWrap(True)
             tip2.setStyleSheet("color:#888;font-size:11px;")
             sv.addWidget(tip2)
@@ -1408,10 +1485,9 @@ def gui_main():
             for r in self.regions:
                 regions.append({
                     "mode": r["mode"],
-                    "r0": [int(v) for v in r["r0"]],
-                    "t0": r.get("t0", 0.0) or 0.0,
-                    "t1": r.get("t1"),
-                    "r1": [int(v) for v in r["r1"]] if r.get("r1") else None,
+                    "keys": [[round(float(k[0]), 4),
+                              [int(round(v)) for v in k[1]]]
+                             for k in norm_keys(r)],
                 })
             self.schemes.append({"name": name, "vw": self.vw, "vh": self.vh,
                                  "regions": regions})
@@ -1439,10 +1515,11 @@ def gui_main():
                                          scheme.get("vw") or self.vw,
                                          scheme.get("vh") or self.vh,
                                          self.vw, self.vh)
-            for r in self.regions:
-                r["r0"] = tuple(r["r0"])
-                if r.get("r1"):
-                    r["r1"] = tuple(r["r1"])
+            # 统一成 keys 模型（旧方案文件自动迁移）
+            self.regions = [{"mode": r["mode"],
+                             "keys": [(k[0], tuple(k[1]))
+                                      for k in norm_keys(r)]}
+                            for r in self.regions]
             self._sel = len(self.regions) - 1 if self.regions else -1
             self._refresh_view()
             self._refresh_panel()
@@ -1477,23 +1554,39 @@ def gui_main():
                               region_active(reg, self._cur_t)))
             return items
 
+        def _ghost_items(self):
+            """选中框的全部关键帧位置（青色虚线提示，首末位置一眼可见）。"""
+            if not (0 <= self._sel < len(self.regions)):
+                return []
+            out = []
+            for i, (t, r) in enumerate(norm_keys(self.regions[self._sel])):
+                x, y, w, h = r
+                if self.vw:
+                    x, y, w, h = clamp_rect(x, y, w, h, self.vw, self.vh)
+                out.append((QRect(int(x), int(y), int(w), int(h)),
+                            f"K{i + 1} {self._fmt_time(t)}"))
+            return out
+
         def _refresh_view(self):
             self.preview.set_items(self._display_items(), self._sel)
+            self.preview.set_ghosts(self._ghost_items())
             self._refresh_list()
 
         def _refresh_list(self):
             self.list_rects.blockSignals(True)
             self.list_rects.clear()
             for i, reg in enumerate(self.regions):
-                x, y, w, h = [int(v) for v in reg["r0"]]
-                t0 = reg.get("t0", 0.0) or 0.0
-                t1 = reg.get("t1")
-                tr = "全程" if (t0 <= 0 and t1 is None) else \
-                    f"{self._fmt_time(t0)}-{self._fmt_time(t1) if t1 is not None else '结尾'}"
-                mv = "·移动" if reg.get("r1") else ""
+                ks = norm_keys(reg)
+                x, y, w, h = [int(round(v)) for v in ks[0][1]]
+                if len(ks) == 1:
+                    tr = "全程静止" if ks[0][0] <= 0 else \
+                        f"{self._fmt_time(ks[0][0])}起"
+                else:
+                    tr = (f"K{len(ks)} {self._fmt_time(ks[0][0])}"
+                          f"-{self._fmt_time(ks[-1][0])}")
                 self.list_rects.addItem(
                     f"#{i + 1} x={x} y={y} w={w} h={h}"
-                    f"　{MODE_NAMES.get(reg['mode'])}　{tr}{mv}")
+                    f"　{MODE_NAMES.get(reg['mode'])}　{tr}")
             self.list_rects.blockSignals(False)
             self.list_rects.setCurrentRow(self._sel)
 
@@ -1508,48 +1601,105 @@ def gui_main():
                         self.cmb_style.setCurrentIndex(i)
                         self.cmb_style.blockSignals(False)
                         break
-                t0 = reg.get("t0", 0.0) or 0.0
-                t1 = reg.get("t1")
-                self.lbl_trange.setText(
-                    "生效时间：全程" if (t0 <= 0 and t1 is None)
-                    else f"生效：{self._fmt_time(t0)} ~ "
-                         f"{self._fmt_time(t1) if t1 is not None else '结尾'}")
-                self.lbl_move.setText(
-                    "移动水印：已启用" if reg.get("r1") else "移动水印：未启用")
+                ks = norm_keys(reg)
+                if len(ks) == 1:
+                    txt = ("关键帧：1 个（全程静止）" if ks[0][0] <= 0
+                           else f"关键帧：1 个（{self._fmt_time(ks[0][0])} 起到结尾）")
+                else:
+                    txt = (f"关键帧：{len(ks)} 个（{self._fmt_time(ks[0][0])}"
+                           f" ~ {self._fmt_time(ks[-1][0])}，跟踪移动）")
+                self.lbl_keys.setText(txt)
             else:
                 self.lbl_sel.setText("未选中框（下面样式将作为新框默认）")
-                self.lbl_trange.setText("生效时间：全程")
-                self.lbl_move.setText("移动水印：未启用")
+                self.lbl_keys.setText("关键帧：—")
 
         # ---------- 框事件 ----------
         def _on_rect_drawn(self, rect):
             mode = STYLE_MODES[self.cmb_style.currentIndex()][1]
-            self.regions.append({"mode": mode,
-                                 "r0": (rect.x(), rect.y(),
-                                        rect.width(), rect.height()),
-                                 "t0": 0.0, "t1": None, "r1": None})
+            r0 = (rect.x(), rect.y(), rect.width(), rect.height())
+            self.regions.append({"mode": mode, "keys": [(0.0, r0)]})
             self._sel = len(self.regions) - 1
             self._refresh_view()
             self._refresh_panel()
             self.lbl_status.setText(f"已框选 {len(self.regions)} 个水印区域")
+
+        def _key_eps(self):
+            return 0.5 / max(1.0, self.fps)
+
+        def _upsert_key(self, reg, t, rect):
+            """在 t 处新增/更新关键帧（半帧容差内视为同一帧）。"""
+            eps = self._key_eps()
+            ks = norm_keys(reg)
+            for i, (kt, _) in enumerate(ks):
+                if abs(kt - t) <= eps:
+                    ks[i] = (kt, tuple(float(v) for v in rect))
+                    reg["keys"] = ks
+                    return
+            ks.append((float(t), tuple(float(v) for v in rect)))
+            ks.sort(key=lambda e: e[0])
+            reg["keys"] = ks
 
         def _on_rect_transformed(self, idx, rect):
             if not (0 <= idx < len(self.regions)):
                 return
             reg = self.regions[idx]
             new = (rect.x(), rect.y(), rect.width(), rect.height())
-            if reg.get("t1") is not None:
-                # 已设定时间范围：改动写到时间较近的一端（自动形成移动）
-                t0 = reg.get("t0", 0.0) or 0.0
-                t1 = reg.get("t1") or self.duration or 0.0
-                mid = (t0 + t1) / 2.0
-                if self._cur_t <= mid:
-                    reg["r0"] = new
-                else:
-                    reg["r1"] = new
-            else:
-                reg["r0"] = new
+            # 自动关键帧：当前时间已有关键帧则更新，否则新增（跟踪移动水印）
+            self._upsert_key(reg, self._cur_t, new)
             self._refresh_list()
+            self._refresh_panel()
+
+        def _key_start_here(self):
+            """生效起点设为当前帧：丢弃更早的关键帧，当前位置记为首个关键帧。"""
+            if not (0 <= self._sel < len(self.regions)):
+                return
+            reg = self.regions[self._sel]
+            cur = rect_at(reg, self._cur_t)
+            ks = [(t, r) for t, r in norm_keys(reg) if t >= self._cur_t - self._key_eps()]
+            reg["keys"] = [(float(self._cur_t), tuple(cur))] + ks
+            self._refresh_view()
+            self._refresh_panel()
+
+        def _key_end_here(self):
+            """生效终点设为当前帧：丢弃更晚的关键帧，当前位置记为末个关键帧。"""
+            if not (0 <= self._sel < len(self.regions)):
+                return
+            reg = self.regions[self._sel]
+            cur = rect_at(reg, self._cur_t)
+            ks = [(t, r) for t, r in norm_keys(reg) if t <= self._cur_t + self._key_eps()]
+            reg["keys"] = ks + [(float(self._cur_t), tuple(cur))]
+            self._refresh_view()
+            self._refresh_panel()
+
+        def _del_key_here(self):
+            if not (0 <= self._sel < len(self.regions)):
+                return
+            reg = self.regions[self._sel]
+            ks = norm_keys(reg)
+            if len(ks) <= 1:
+                self.lbl_status.setText("至少保留 1 个关键帧（可用「设为静止全程」重置）")
+                return
+            eps = self._key_eps()
+            cand = [i for i, (kt, _) in enumerate(ks) if abs(kt - self._cur_t) <= eps]
+            if not cand:
+                # 没有正好落在当前帧的，就删时间最近的一个
+                cand = [min(range(len(ks)),
+                            key=lambda i: abs(ks[i][0] - self._cur_t))]
+            del ks[cand[0]]
+            reg["keys"] = ks
+            self._refresh_view()
+            self._refresh_panel()
+            self.lbl_status.setText(f"已删除关键帧，剩余 {len(ks)} 个")
+
+        def _make_static(self):
+            if not (0 <= self._sel < len(self.regions)):
+                return
+            reg = self.regions[self._sel]
+            cur = rect_at(reg, self._cur_t)
+            reg["keys"] = [(0.0, tuple(int(round(v)) for v in cur))]
+            self._refresh_view()
+            self._refresh_panel()
+            self.lbl_status.setText(f"#{self._sel + 1} 号框已设为全程静止")
 
         def _on_rect_deleted(self, idx):
             if 0 <= idx < len(self.regions):
@@ -1586,36 +1736,6 @@ def gui_main():
                     f"#{self._sel + 1} 号框样式已改为"
                     f"「{MODE_NAMES[STYLE_MODES[idx][1]]}」")
 
-        def _set_t0(self):
-            if 0 <= self._sel < len(self.regions):
-                reg = self.regions[self._sel]
-                reg["t0"] = round(self._cur_t, 2)
-                if reg.get("t1") is not None and reg["t1"] < reg["t0"]:
-                    reg["t1"] = reg["t0"]
-                self._refresh_view()
-                self._refresh_panel()
-
-        def _set_t1(self):
-            if 0 <= self._sel < len(self.regions):
-                reg = self.regions[self._sel]
-                reg["t1"] = round(max(self._cur_t,
-                                      reg.get("t0", 0.0) or 0.0), 2)
-                self._refresh_view()
-                self._refresh_panel()
-
-        def _clear_trange(self):
-            if 0 <= self._sel < len(self.regions):
-                self.regions[self._sel]["t0"] = 0.0
-                self.regions[self._sel]["t1"] = None
-                self._refresh_view()
-                self._refresh_panel()
-
-        def _clear_r1(self):
-            if 0 <= self._sel < len(self.regions):
-                self.regions[self._sel]["r1"] = None
-                self._refresh_view()
-                self._refresh_panel()
-
         def _on_preset(self, idx):
             if idx == 0 or self.vw == 0:
                 return
@@ -1638,8 +1758,7 @@ def gui_main():
             x, y = pos.get(idx, (mx, my))
             x, y, w, h = clamp_rect(x, y, w, h, self.vw, self.vh)
             mode = STYLE_MODES[self.cmb_style.currentIndex()][1]
-            self.regions.append({"mode": mode, "r0": (x, y, w, h),
-                                 "t0": 0.0, "t1": None, "r1": None})
+            self.regions.append({"mode": mode, "keys": [(0.0, (x, y, w, h))]})
             self._sel = len(self.regions) - 1
             self._refresh_view()
             self._refresh_panel()
@@ -1648,20 +1767,141 @@ def gui_main():
             self.cmb_preset.setCurrentIndex(0)
             self.cmb_preset.blockSignals(False)
 
-        # ---------- 视频加载 / 预览 ----------
+        # ---------- 视频加载 / 预览 / 播放 ----------
         def open_video(self):
             path, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", VIDEO_FILTER)
             if not path:
                 return
+            self._pause()
+            self._close_cap()
             self.video_path = path
-            self.duration = get_duration(self.ffmpeg, path)
             self.slider.setEnabled(True)
             self.slider.setValue(0)
             stem, _ = os.path.splitext(os.path.basename(path))
             self.ed_out.setText(os.path.join(os.path.dirname(path), stem + "_去水印.mp4"))
             self._clear_all()
             self._grabbing = False
-            self._request_frame(0.0)
+            # 优先用 cv2 顺序读取（支持播放/逐帧）；失败回退 ffmpeg 抽帧
+            import cv2
+            cap = None
+            try:
+                c = cv2.VideoCapture(path)
+                if c.isOpened():
+                    cap = c
+            except Exception:
+                cap = None
+            if cap is not None:
+                self._cap = cap
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                self.fps = fps if fps > 1 else 25.0
+                self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+                self.duration = (self.total_frames / self.fps
+                                 if self.total_frames else
+                                 get_duration(self.ffmpeg, path))
+                for b in (self.btn_stop, self.btn_prev, self.btn_play,
+                          self.btn_next):
+                    b.setEnabled(True)
+                self._seek_frame(0)
+            else:
+                self.fps = 25.0
+                self.total_frames = 0
+                self.duration = get_duration(self.ffmpeg, path)
+                for b in (self.btn_stop, self.btn_prev, self.btn_play,
+                          self.btn_next):
+                    b.setEnabled(False)
+                self._request_frame(0.0)
+
+        def _close_cap(self):
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+
+        def closeEvent(self, ev):
+            self._pause()
+            self._close_cap()
+            super().closeEvent(ev)
+
+        # --- cv2 帧显示 ---
+        def _show_cv_frame(self, frame, fidx):
+            import cv2
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            img = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+            if self.vw != w or self.vh != h:
+                self.vw, self.vh = w, h
+                self._update_info()
+            self._cur_f = fidx
+            self._cur_t = fidx / self.fps
+            self.preview.setText("")
+            self.preview.set_frame(img)
+            self._update_time_label(self._cur_t)
+            self.slider.blockSignals(True)
+            if self.duration > 0:
+                self.slider.setValue(
+                    max(0, min(1000, int(self._cur_t / self.duration * 1000))))
+            self.slider.blockSignals(False)
+            self._refresh_view()
+
+        def _seek_frame(self, fidx):
+            if self._cap is None:
+                self._request_frame(max(0.0, fidx / self.fps))
+                return
+            if self.total_frames:
+                fidx = max(0, min(self.total_frames - 1, fidx))
+            import cv2
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ok, frame = self._cap.read()
+            if ok:
+                real = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                self._show_cv_frame(frame, max(fidx, real if real >= 0 else fidx))
+
+        # --- 播放 / 暂停 / 停止 / 逐帧 ---
+        def _toggle_play(self):
+            if self._playing:
+                self._pause()
+            else:
+                self._play()
+
+        def _play(self):
+            if self._cap is None or self._playing:
+                return
+            if self.total_frames and self._cur_f >= self.total_frames - 1:
+                self._seek_frame(0)   # 到结尾后再播放则从头开始
+            self._playing = True
+            self.btn_play.setText("⏸ 暂停")
+            self._timer.start(max(15, int(1000 / self.fps)))
+
+        def _pause(self):
+            if getattr(self, "_timer", None) is None:
+                return
+            self._timer.stop()
+            self._playing = False
+            self.btn_play.setText("▶ 播放")
+
+        def _stop(self):
+            self._pause()
+            self._seek_frame(0)
+
+        def _step_frame(self, d):
+            if self._cap is None:
+                return
+            self._pause()
+            self._seek_frame(self._cur_f + d)
+
+        def _play_tick(self):
+            if self._cap is None:
+                self._pause()
+                return
+            ok, frame = self._cap.read()
+            if not ok:
+                self._pause()   # 播到结尾自动停
+                return
+            import cv2
+            fidx = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            self._show_cv_frame(frame, max(0, fidx))
 
         def choose_output(self):
             default = self.ed_out.text().strip() or "output_去水印.mp4"
@@ -1672,9 +1912,12 @@ def gui_main():
 
         def _on_slider(self, v):
             if self.video_path and self.duration > 0:
-                self._request_frame(self.duration * v / 1000.0)
+                self._pause()
+                fidx = int(round(self.duration * v / 1000.0 * self.fps))
+                self._seek_frame(fidx)
 
         def _request_frame(self, t):
+            """ffmpeg 抽帧回退路径（cv2 打不开该视频时使用）。"""
             self._pending_t = t
             if self._grabbing:
                 return
@@ -1691,6 +1934,7 @@ def gui_main():
         def _on_frame(self, data, t):
             self._grabbing = False
             self._cur_t = t
+            self._cur_f = int(round(t * self.fps))
             if data:
                 img = QImage.fromData(data)
                 if not img.isNull():
@@ -1707,24 +1951,30 @@ def gui_main():
         def _update_info(self):
             name = os.path.basename(self.video_path or "")
             self.lbl_info.setText(
-                f"{name}\n分辨率：{self.vw}×{self.vh}　时长：{self._fmt_time(self.duration)}")
+                f"{name}\n分辨率：{self.vw}×{self.vh}　时长：{self._fmt_time(self.duration)}"
+                f"　{self.fps:.2f} fps")
 
         def _update_time_label(self, t):
+            fidx = int(round(t * self.fps))
+            total = (f"（第 {fidx} 帧 / 共 {self.total_frames} 帧）"
+                     if self.total_frames else "")
             self.lbl_time.setText(
-                f"{self._fmt_time(t)} / {self._fmt_time(self.duration)}")
+                f"{self._fmt_time(t)} / {self._fmt_time(self.duration)}{total}")
 
         @staticmethod
         def _fmt_time(s):
             if s is None:
                 return "结尾"
-            s = max(0, int(s))
-            return f"{s // 60:02d}:{s % 60:02d}"
+            s = max(0.0, float(s))
+            m = int(s // 60)
+            return f"{m:02d}:{s - m * 60:05.2f}"
 
         # ---------- 处理 ----------
         def start_process(self):
             if not self.video_path:
                 QMessageBox.warning(self, APP_NAME, "请先选择视频文件")
                 return
+            self._pause()
             if not self.regions:
                 QMessageBox.warning(self, APP_NAME,
                                     "请先框选至少一个水印区域（可框多个）")
