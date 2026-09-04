@@ -15,7 +15,7 @@ import sys
 import threading
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_EXE = "视频水印擦除工具.exe"
 UNINST_EXE = "卸载.exe"
 REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\VideoWatermarkEraser"

@@ -28,7 +28,7 @@ import threading
 import urllib.request
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 # 在线升级：GitHub Releases
 UPDATE_REPO = "retision-coder/video-tools"
@@ -1197,6 +1197,73 @@ def gui_main():
                 f"输出目录：{self.ed_dir.text()}")
             self.worker = None
 
+    class TitleBar(QWidget):
+        """自绘标题栏：左侧应用名+版本，右侧 检查更新 / 最小化 / 最大化 / 关闭。
+        支持拖动移动窗口、双击切换最大化。"""
+
+        def __init__(self, win):
+            super().__init__(win)
+            self.win = win
+            self._drag_pos = None
+            self.setFixedHeight(36)
+            self.setStyleSheet("background:#2b2f36;color:#ddd;")
+            h = QHBoxLayout(self)
+            h.setContentsMargins(10, 0, 4, 0)
+            h.setSpacing(4)
+            self.lbl_title = QLabel(f"{APP_NAME}  v{APP_VERSION}")
+            self.lbl_title.setStyleSheet("font-weight:bold;color:#eee;")
+            h.addWidget(self.lbl_title)
+            h.addStretch(1)
+            win.btn_update = QPushButton("⟳ 检查更新")
+            win.btn_update.setStyleSheet(
+                "QPushButton{background:transparent;color:#7ec3ff;border:none;"
+                "padding:4px 10px;}"
+                "QPushButton:hover{background:#3a4058;}")
+            win.btn_update.setCursor(Qt.PointingHandCursor)
+            h.addWidget(win.btn_update)
+            for text, slot, hover in (
+                    ("—", win.showMinimized, "#3a4058"),
+                    ("▢", self._toggle_max, "#3a4058"),
+                    ("✕", win.close, "#e04848")):
+                b = QPushButton(text)
+                b.setFixedSize(40, 28)
+                b.setStyleSheet(
+                    f"QPushButton{{background:transparent;color:#ccc;"
+                    f"border:none;font-size:13px;}}"
+                    f"QPushButton:hover{{background:{hover};}}")
+                b.clicked.connect(slot)
+                h.addWidget(b)
+
+        def _toggle_max(self):
+            if self.win.isMaximized():
+                self.win.showNormal()
+            else:
+                self.win.showMaximized()
+
+        def paintEvent(self, ev):
+            # 自定义 QWidget 需要走 QStyle 才能让样式表背景生效
+            from PyQt5.QtWidgets import QStyle, QStyleOption
+            opt = QStyleOption()
+            opt.initFrom(self)
+            p = QPainter(self)
+            self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
+            p.end()
+
+        def mousePressEvent(self, ev):
+            if ev.button() == Qt.LeftButton and not self.win.isMaximized():
+                self._drag_pos = ev.globalPos() - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, ev):
+            if self._drag_pos is not None and ev.buttons() & Qt.LeftButton:
+                self.win.move(ev.globalPos() - self._drag_pos)
+
+        def mouseReleaseEvent(self, ev):
+            self._drag_pos = None
+
+        def mouseDoubleClickEvent(self, ev):
+            if ev.button() == Qt.LeftButton:
+                self._toggle_max()
+
     class MainWindow(QMainWindow):
         frameGrabbed = pyqtSignal(object, float)
         updateChecked = pyqtSignal(object, object)   # (release dict|None, error str|None)
@@ -1209,6 +1276,7 @@ def gui_main():
         def __init__(self):
             super().__init__()
             self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
             self.resize(1260, 1280)
             try:
                 self.ffmpeg = get_ffmpeg()
@@ -1432,22 +1500,29 @@ def gui_main():
             rv.addWidget(self.lbl_status)
             rv.addStretch(1)
 
-            urow = QHBoxLayout()
             lbl_ver = QLabel(f"v{APP_VERSION}")
             lbl_ver.setStyleSheet("color:#999;")
-            self.btn_update = QPushButton("检查更新")
-            self.btn_update.clicked.connect(self.check_update)
-            urow.addWidget(lbl_ver)
-            urow.addStretch(1)
-            urow.addWidget(self.btn_update)
-            rv.addLayout(urow)
+            rv.addWidget(lbl_ver)
 
             sp = QSplitter(Qt.Horizontal)
             sp.addWidget(left)
             sp.addWidget(right)
             sp.setStretchFactor(0, 1)
             sp.setStretchFactor(1, 0)
-            self.setCentralWidget(sp)
+
+            # 自绘标题栏 + 内容区
+            container = QWidget()
+            cv = QVBoxLayout(container)
+            cv.setContentsMargins(0, 0, 0, 0)
+            cv.setSpacing(0)
+            self.titlebar = TitleBar(self)
+            self.btn_update.clicked.connect(self.check_update)
+            cv.addWidget(self.titlebar)
+            cv.addWidget(sp, 1)
+            self.setCentralWidget(container)
+            # 右下角拖拽缩放手柄（无边框窗口用）
+            self.statusBar().setSizeGripEnabled(True)
+            self.statusBar().show()
             self._refresh_panel()
 
         # ---------- 方案 ----------
