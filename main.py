@@ -28,7 +28,7 @@ import threading
 import urllib.request
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # 在线升级：GitHub Releases
 UPDATE_REPO = "retision-coder/video-tools"
@@ -531,7 +531,8 @@ def cli_main(args):
 # ---------------------------------------------------------------------------
 
 def gui_main():
-    from PyQt5.QtCore import (QPoint, QRect, QSize, Qt, QThread, pyqtSignal)
+    from PyQt5.QtCore import (QPoint, QRect, QSize, Qt, QThread, QTimer,
+                              pyqtSignal)
     from PyQt5.QtGui import QImage, QPainter, QPen, QColor
     from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog,
                                  QGroupBox, QHBoxLayout, QInputDialog, QLabel,
@@ -928,6 +929,9 @@ def gui_main():
     class MainWindow(QMainWindow):
         frameGrabbed = pyqtSignal(object, float)
         updateChecked = pyqtSignal(object, object)   # (release dict|None, error str|None)
+        updateAuto = pyqtSignal(object, object)      # 后台自动检查结果
+        dlProgress = pyqtSignal(int)                 # 后台下载进度
+        dlDone = pyqtSignal(str, object)             # 后台下载完成 (path|"", err|None)
 
         def __init__(self):
             super().__init__()
@@ -946,11 +950,20 @@ def gui_main():
             self._cur_t = 0.0
             self.worker = None
             self.regions = []   # [{'mode','r0','t0','t1','r1'}]
+            self._pending_update = None   # 已预下载完成的安装包路径
+            self._auto_tag = None
+            self._auto_body = ""
             self._sel = -1
             self.schemes = load_schemes()
             self._build_ui()
             self.frameGrabbed.connect(self._on_frame)
             self.updateChecked.connect(self._on_update_checked)
+            self.updateAuto.connect(self._on_auto_checked)
+            self.dlProgress.connect(self._on_dl_progress)
+            self.dlDone.connect(self._on_auto_downloaded)
+            # 安装版启动 4 秒后在后台静默检查更新
+            if getattr(sys, "frozen", False):
+                QTimer.singleShot(4000, self._auto_check)
 
         # ---------- UI ----------
         def _build_ui(self):
@@ -1537,6 +1550,97 @@ def gui_main():
             self.btn_cancel.setVisible(running)
 
         # ---------- 在线升级 ----------
+        # ---------- 后台自动更新 ----------
+        def _update_state_path(self):
+            return os.path.join(config_dir(), "update_state.json")
+
+        def _load_update_state(self):
+            try:
+                with open(self._update_state_path(), encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+
+        def _save_update_state(self, st):
+            try:
+                with open(self._update_state_path(), "w", encoding="utf-8") as f:
+                    json.dump(st, f, ensure_ascii=False)
+            except Exception:
+                pass
+
+        def _auto_check(self):
+            """启动后后台静默检查更新；失败不打扰用户。"""
+            def job():
+                try:
+                    self.updateAuto.emit(fetch_latest_release(), None)
+                except Exception as e:
+                    self.updateAuto.emit(None, str(e))
+
+            threading.Thread(target=job, daemon=True).start()
+
+        def _on_auto_checked(self, release, err):
+            if err or not release:
+                return  # 静默忽略
+            tag = release.get("tag_name", "")
+            if parse_version(tag) <= parse_version(APP_VERSION):
+                return
+            if self._load_update_state().get("skipped") == tag:
+                return  # 用户已跳过该版本
+            asset = pick_asset(release)
+            if not asset:
+                return
+            self._auto_tag = tag
+            self._auto_body = (release.get("body") or "").strip()
+            dst = os.path.join(tempfile.gettempdir(), asset["name"])
+            # 已完整下载过则直接提示
+            if os.path.isfile(dst) and os.path.getsize(dst) == asset.get("size"):
+                self.dlDone.emit(dst, None)
+                return
+            self.lbl_status.setText(f"发现新版本 {tag}，正在后台下载…")
+
+            def job():
+                try:
+                    download_file(asset["browser_download_url"], dst,
+                                  progress_cb=self.dlProgress.emit)
+                    self.dlDone.emit(dst, None)
+                except Exception as e:
+                    self.dlDone.emit("", str(e))
+
+            threading.Thread(target=job, daemon=True).start()
+
+        def _on_dl_progress(self, p):
+            if self._auto_tag:
+                self.lbl_status.setText(
+                    f"正在后台下载新版本 {self._auto_tag}… {p}%")
+
+        def _on_auto_downloaded(self, path, err):
+            if err or not path:
+                self.lbl_status.setText("就绪")
+                return
+            self._pending_update = path
+            self.lbl_status.setText(f"新版本 {self._auto_tag} 已就绪，可升级")
+            box = QMessageBox(self)
+            box.setWindowTitle(APP_NAME)
+            box.setIcon(QMessageBox.Information)
+            box.setText(f"新版本 {self._auto_tag} 已下载完成！\n\n"
+                        "点击「立即升级」将关闭程序并自动完成安装，"
+                        "随后自动启动新版本。")
+            if self._auto_body:
+                box.setDetailedText(self._auto_body)
+            btn_now = box.addButton("立即升级", QMessageBox.AcceptRole)
+            box.addButton("下次再说", QMessageBox.RejectRole)
+            btn_skip = box.addButton("跳过此版本", QMessageBox.DestructiveRole)
+            box.exec_()
+            c = box.clickedButton()
+            if c is btn_now:
+                self._apply_upgrade(path)
+            elif c is btn_skip:
+                st = self._load_update_state()
+                st["skipped"] = self._auto_tag
+                self._save_update_state(st)
+                self._pending_update = None
+                self.lbl_status.setText(f"已跳过 {self._auto_tag}")
+
         def check_update(self):
             self.btn_update.setEnabled(False)
             self.lbl_status.setText("正在检查更新…")
@@ -1598,6 +1702,12 @@ def gui_main():
             cancel_ev = threading.Event()
             dlg.canceled.connect(cancel_ev.set)
             dst = os.path.join(tempfile.gettempdir(), asset["name"])
+            # 后台已预下载完成（大小一致）则直接安装，不重复下载
+            if (os.path.isfile(dst)
+                    and os.path.getsize(dst) == (asset.get("size") or -1)):
+                dlg.close()
+                self._apply_upgrade(dst)
+                return
             result = {}
 
             def job():
