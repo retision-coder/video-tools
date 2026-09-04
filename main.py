@@ -3,13 +3,15 @@
 视频水印擦除工具
 ----------------
 - 支持常见本地视频格式（mp4/avi/mkv/mov/flv/wmv/ts/m4v/webm/mpg/3gp 等）
-- 预览画面 + 时间轴拖动定位
+- 播放/暂停/停止/逐帧预览，时间精确到帧
 - 支持【多个水印区域】：拖框添加、四角拖拽调大小、按住移动、右键/Delete 删除
-- 每个区域可单独设置：擦除样式、生效时间范围、移动结束位置（线性跟随移动水印）
+- 每个区域可单独设置擦除样式；拖动红框自动打【关键帧】跟踪移动水印
+  （可打任意多个，帧级精度，相邻关键帧间线性插值）
 - 【方案】：当前框选配置可保存为"方案1/方案2…"，同水印视频一键套用；
   方案按保存时的分辨率记录，套用到不同分辨率视频时自动等比缩放
 - 【批量处理】：一次导入多个视频或整个文件夹，套用当前框选，统一导出到指定目录
-- 擦除样式：智能修复（OpenCV NS inpaint + 掩码外扩 + 接缝羽化）/ 高斯模糊 / 马赛克
+- 擦除样式：智能修复（OpenCV NS inpaint + 掩码外扩 + 接缝羽化）/
+  AI 精修（LaMa 大模型，组件按需下载、离线运行）/ 高斯模糊 / 马赛克
 - 处理引擎：OpenCV 逐帧处理 + ffmpeg 编码（imageio-ffmpeg 自带，pip 安装即可）
 
 CLI 模式（--rect 可重复，字段：x,y,w,h[,mode[,t0,t1[,x1,y1]]]）：
@@ -27,11 +29,11 @@ import tempfile
 import threading
 import urllib.request
 
-APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.5.2"
+from version import APP_NAME, APP_VERSION, UPDATE_REPO
+from wm_core import (apply_region, build_encode_cmd, clamp_rect, norm_keys,
+                     open_capture, rect_at, region_active)
 
-# 在线升级：GitHub Releases
-UPDATE_REPO = "retision-coder/video-tools"
+# 在线升级：GitHub Releases API（可用环境变量覆盖，便于测试）
 UPDATE_API = (os.environ.get("WATERMARK_UPDATE_API")
               or f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest")
 
@@ -209,122 +211,22 @@ def probe_size(path):
 
 
 # ---------------------------------------------------------------------------
-# 区域模型与逐帧处理引擎
+# 逐帧处理引擎（区域关键帧模型见 wm_core.py，与 AI 引擎共享）
 # ---------------------------------------------------------------------------
-
-def clamp_rect(x, y, w, h, vw, vh):
-    w = max(4, min(int(round(w)), vw))
-    h = max(4, min(int(round(h)), vh))
-    x = max(0, min(int(round(x)), vw - w))
-    y = max(0, min(int(round(y)), vh - h))
-    return x, y, w, h
-
-
-def norm_keys(reg):
-    """统一成关键帧列表 [(t, (x,y,w,h)), ...]，按时间排序。
-    兼容旧格式 r0/t0/t1/r1（等价于 1~2 个关键帧）。"""
-    ks = reg.get("keys")
-    if ks:
-        out = [(float(k[0]), tuple(float(v) for v in k[1])) for k in ks]
-        out.sort(key=lambda e: e[0])
-        return out
-    r0 = tuple(float(v) for v in reg["r0"])
-    t0 = float(reg.get("t0") or 0.0)
-    t1 = reg.get("t1")
-    r1 = reg.get("r1")
-    if t1 is not None:
-        end = tuple(float(v) for v in (r1 if r1 else reg["r0"]))
-        return [(t0, r0), (float(t1), end)]
-    return [(t0, r0)]
-
-
-def region_active(reg, t):
-    """1 个关键帧：从该帧到结尾生效；≥2 个：首末关键帧之间生效。"""
-    ks = norm_keys(reg)
-    if len(ks) == 1:
-        return t >= ks[0][0] - 1e-6
-    return ks[0][0] - 1e-6 <= t <= ks[-1][0] + 1e-6
-
-
-def rect_at(reg, t):
-    """t 时刻区域的 (x, y, w, h) 浮点值；相邻关键帧之间线性插值。"""
-    ks = norm_keys(reg)
-    if len(ks) == 1 or t <= ks[0][0]:
-        return ks[0][1]
-    if t >= ks[-1][0]:
-        return ks[-1][1]
-    for i in range(len(ks) - 1):
-        t0, r0 = ks[i]
-        t1, r1 = ks[i + 1]
-        if t0 - 1e-9 <= t <= t1 + 1e-9:
-            k = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
-            return tuple(a + (b - a) * k for a, b in zip(r0, r1))
-    return ks[-1][1]
-
-
-def _apply_region(frame, mode, x, y, w, h):
-    import cv2
-    import numpy as np
-    fh, fw = frame.shape[:2]
-    x, y, w, h = clamp_rect(x, y, w, h, fw, fh)
-    if mode == "inpaint":
-        pad = 20
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(fw, x + w + pad), min(fh, y + h + pad)
-        roi = frame[y0:y1, x0:x1]
-        mask = np.zeros(roi.shape[:2], np.uint8)
-        mask[y - y0:y - y0 + h, x - x0:x - x0 + w] = 255
-        # 掩码外扩，吃掉水印边缘残留
-        mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=2)
-        # Navier-Stokes 修复：大块区域融合比 Telea 更平滑
-        res = cv2.inpaint(roi, mask, 7, cv2.INPAINT_NS)
-        # 接缝羽化：软掩码混合，消除修复区与周边的边界痕
-        soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 4)[..., None]
-        frame[y0:y1, x0:x1] = (
-            res.astype(np.float32) * soft
-            + roi.astype(np.float32) * (1 - soft)
-        ).astype(np.uint8)
-    elif mode == "blur":
-        roi = frame[y:y + h, x:x + w]
-        frame[y:y + h, x:x + w] = cv2.GaussianBlur(roi, (0, 0), 28)
-    elif mode == "mosaic":
-        roi = frame[y:y + h, x:x + w]
-        small = cv2.resize(roi, (max(2, w // 14), max(2, h // 14)),
-                           interpolation=cv2.INTER_LINEAR)
-        frame[y:y + h, x:x + w] = cv2.resize(small, (w, h),
-                                             interpolation=cv2.INTER_NEAREST)
-    return frame
-
 
 def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None):
     """
-    逐帧处理视频。regions: [{'mode','r0','t0','t1','r1'}, ...]
+    逐帧处理视频。regions: [{'mode','keys':[(t,(x,y,w,h)),...]}, ...]
     返回 (ok, message)。
     """
-    import cv2
     if not regions:
         return False, "没有有效的水印区域"
-    cap = cv2.VideoCapture(inp)
-    if not cap.isOpened():
+    info = open_capture(inp)
+    if info is None:
         return False, "无法打开视频文件"
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if fps <= 1:
-        fps = 25.0
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    cap, fps, W, H, total = info
 
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{W}x{H}", "-r", f"{fps:.6f}", "-i", "-",
-        "-i", inp,
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "copy",
-        "-movflags", "+faststart",
-        outp,
-    ]
+    cmd = build_encode_cmd(ffmpeg, W, H, fps, inp, outp)
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -359,8 +261,8 @@ def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None):
             t = idx / fps
             for reg in regions:
                 if region_active(reg, t):
-                    frame = _apply_region(frame, reg["mode"],
-                                          *rect_at(reg, t))
+                    frame = apply_region(frame, reg["mode"],
+                                         *rect_at(reg, t))
             proc.stdin.write(frame.tobytes())
             idx += 1
             if progress_cb and total > 0 and idx % 5 == 0:
@@ -611,19 +513,22 @@ def ensure_ai_component(log=print, cancel=None):
 
 
 def engine_script():
+    """返回 AI 引擎脚本路径；打包版先把脚本及其共享依赖复制到干净目录。"""
     if getattr(sys, "frozen", False):
-        src = os.path.join(sys._MEIPASS, "ai_engine.py")
         # 不能直接在 _MEIPASS 里运行：脚本所在目录会成为子进程 sys.path[0]，
         # _MEIPASS 里打包版自带的 3.12 版 _ctypes.pyd 会污染 AI 环境导致
         # "python312.dll conflicts" 错误。复制到干净目录再运行。
-        dst = os.path.join(config_dir(), "ai_engine_runtime.py")
-        try:
-            if (not os.path.isfile(dst)
-                    or os.path.getsize(dst) != os.path.getsize(src)):
-                shutil.copy2(src, dst)
-        except Exception:
-            return src
-        return dst
+        # ai_engine.py 依赖 wm_core.py，两者必须一起复制。
+        for name in ("ai_engine.py", "wm_core.py"):
+            src = os.path.join(sys._MEIPASS, name)
+            dst = os.path.join(config_dir(), name)
+            try:
+                if (not os.path.isfile(dst)
+                        or os.path.getsize(dst) != os.path.getsize(src)):
+                    shutil.copy2(src, dst)
+            except Exception:
+                return os.path.join(sys._MEIPASS, "ai_engine.py")
+        return os.path.join(config_dir(), "ai_engine.py")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "ai_engine.py")
 
@@ -742,11 +647,16 @@ def cli_main(args):
             return 2
         t0 = float(parts[5]) if len(parts) >= 7 else 0.0
         t1 = float(parts[6]) if len(parts) >= 7 else None
-        r1 = None
-        if len(parts) == 9:
-            r1 = (int(parts[7]), int(parts[8]), w, h)
-        regions.append({"mode": mode, "r0": (x, y, w, h),
-                        "t0": t0, "t1": t1, "r1": r1})
+        r0 = (x, y, w, h)
+        # 关键帧格式：单关键帧 = 从 t0 到结尾生效；
+        # 给了 t1 时加末关键帧（带 x1,y1 则线性移动，否则原地到 t1 结束）
+        keys = [[t0, list(r0)]]
+        if t1 is not None:
+            if len(parts) == 9:
+                keys.append([t1, [int(parts[7]), int(parts[8]), w, h]])
+            else:
+                keys.append([t1, list(r0)])
+        regions.append({"mode": mode, "keys": keys})
 
     def cb(p):
         print(f"\r进度 {p}%", end="", flush=True)
@@ -2028,8 +1938,7 @@ def gui_main():
 
         @staticmethod
         def _fmt_time(s):
-            if s is None:
-                return "结尾"
+            """秒 → mm:ss.xx 显示"""
             s = max(0.0, float(s))
             m = int(s // 60)
             return f"{m:02d}:{s - m * 60:05.2f}"

@@ -1,13 +1,13 @@
 # 视频水印擦除工具
 
-**📥 下载安装包：[视频水印擦除工具 v1.5.2 一键安装包（164MB，免联网免管理员）](https://github.com/retision-coder/video-tools/releases/latest)**
+**📥 下载安装包：[视频水印擦除工具 v1.5.3 一键安装包（164MB，免联网免管理员）](https://github.com/retision-coder/video-tools/releases/latest)**
 
 针对本地视频的水印擦除小工具（Windows）。
 支持**多个水印、每框独立样式、框大小调整、关键帧移动水印跟踪（帧级精度）、播放/暂停/停止/逐帧预览、方案复用、批量处理、后台自动更新**。
 
 ## 一键安装（推荐）
 
-双击 `installer/视频水印擦除工具_Setup_v1.5.2.exe`，向导一键安装
+双击 `installer/视频水印擦除工具_Setup_v1.5.3.exe`，向导一键安装
 （无需联网、无需管理员权限，默认装到 `%LOCALAPPDATA%\Programs\`）：
 
 - 自动创建桌面 + 开始菜单快捷方式
@@ -18,7 +18,7 @@
 静默安装（供以后在线升级 / 批量部署调用）：
 
 ```
-视频水印擦除工具_Setup_v1.5.2.exe /S /D=C:\安装目录
+视频水印擦除工具_Setup_v1.5.3.exe /S /D=C:\安装目录
 ```
 
 > 在线升级：主界面右下角「检查更新」→ 自动比对 GitHub Releases 最新版本 →
@@ -27,7 +27,8 @@
 
 ### 发布新版本（维护者）
 
-1. 改 `main.py` / `setup.py` 的 `APP_VERSION` 和 `version_info.txt`，重跑 `build.py` + `build_installer.py`
+1. 只需改 `version.py` 里的 `APP_VERSION`（版本号单一来源，安装程序与版本资源自动同步），
+   重跑 `build.py` + `build_installer.py`
 2. 到 GitHub 仓库 [retision-coder/video-tools](https://github.com/retision-coder/video-tools)
    → Releases → Draft a new release → tag 填 `vX.Y.Z`
 3. 把 `installer\视频水印擦除工具_Setup_vX.Y.Z.exe` 作为资产上传，正文写更新日志，Publish
@@ -92,6 +93,11 @@ python -m venv .venv
 
 依赖全部 pip 一键安装（PyQt5 / opencv-python-headless / imageio-ffmpeg / pyinstaller），
 ffmpeg 由 `imageio-ffmpeg` 自动附带，无需单独安装。
+
+代码结构：`version.py`（版本号单一来源）/ `wm_core.py`（主程序与 AI 引擎共享的
+关键帧区域模型与擦除核心，纯计算、无 GUI 依赖）/ `main.py`（GUI + CLI + 普通擦除链路）
+/ `ai_engine.py`（AI 精修子进程脚本，按需下载的独立 Python 环境运行）/
+`setup.py`（安装向导）/ `build*.py`（打包脚本）。
 
 ## 说明
 

@@ -4,9 +4,11 @@ import os
 import subprocess
 import sys
 
+from version import APP_NAME, APP_VERSION
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_EXE = os.path.join(HERE, "dist", "视频水印擦除工具.exe")
-OUT_NAME = "视频水印擦除工具_Setup_v1.5.2"
+APP_EXE = os.path.join(HERE, "dist", APP_NAME + ".exe")
+OUT_NAME = f"{APP_NAME}_Setup_v{APP_VERSION}"
 
 if not os.path.isfile(APP_EXE):
     sys.exit("请先运行 build.py 生成主程序 exe")
