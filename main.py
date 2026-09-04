@@ -28,7 +28,7 @@ import threading
 import urllib.request
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 # 在线升级：GitHub Releases
 UPDATE_REPO = "retision-coder/video-tools"
@@ -798,7 +798,8 @@ def gui_main():
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setMinimumSize(QSize(480, 270))
+            # 播放区域固定 540×960（720:1280 竖屏比例）
+            self.setFixedSize(540, 960)
             self.setAlignment(Qt.AlignCenter)
             self.setFocusPolicy(Qt.StrongFocus)
             self.setMouseTracking(True)
@@ -1223,7 +1224,6 @@ def gui_main():
             h.addWidget(win.btn_update)
             for text, slot, hover in (
                     ("—", win.showMinimized, "#3a4058"),
-                    ("▢", self._toggle_max, "#3a4058"),
                     ("✕", win.close, "#e04848")):
                 b = QPushButton(text)
                 b.setFixedSize(40, 28)
@@ -1233,12 +1233,6 @@ def gui_main():
                     f"QPushButton:hover{{background:{hover};}}")
                 b.clicked.connect(slot)
                 h.addWidget(b)
-
-        def _toggle_max(self):
-            if self.win.isMaximized():
-                self.win.showNormal()
-            else:
-                self.win.showMaximized()
 
         def paintEvent(self, ev):
             # 自定义 QWidget 需要走 QStyle 才能让样式表背景生效
@@ -1250,7 +1244,7 @@ def gui_main():
             p.end()
 
         def mousePressEvent(self, ev):
-            if ev.button() == Qt.LeftButton and not self.win.isMaximized():
+            if ev.button() == Qt.LeftButton:
                 self._drag_pos = ev.globalPos() - self.win.frameGeometry().topLeft()
 
         def mouseMoveEvent(self, ev):
@@ -1259,10 +1253,6 @@ def gui_main():
 
         def mouseReleaseEvent(self, ev):
             self._drag_pos = None
-
-        def mouseDoubleClickEvent(self, ev):
-            if ev.button() == Qt.LeftButton:
-                self._toggle_max()
 
     class MainWindow(QMainWindow):
         frameGrabbed = pyqtSignal(object, float)
@@ -1277,7 +1267,7 @@ def gui_main():
             super().__init__()
             self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
-            self.resize(1260, 1280)
+            # 固定界面：尺寸在 _build_ui 末尾按内容确定后锁死
             try:
                 self.ffmpeg = get_ffmpeg()
             except RuntimeError as e:
@@ -1520,9 +1510,9 @@ def gui_main():
             cv.addWidget(self.titlebar)
             cv.addWidget(sp, 1)
             self.setCentralWidget(container)
-            # 右下角拖拽缩放手柄（无边框窗口用）
-            self.statusBar().setSizeGripEnabled(True)
-            self.statusBar().show()
+            # 固定界面：按内容尺寸锁死，只允许最小化，不可缩放/最大化
+            self.adjustSize()
+            self.setFixedSize(self.size())
             self._refresh_panel()
 
         # ---------- 方案 ----------
