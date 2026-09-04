@@ -1,8 +1,15 @@
 # 运行依赖
 PyQt5>=5.15
-opencv-contrib-python-headless>=4.8
+# OpenCV 与 numpy 锁定版本：numpy 2.x 需要 PyInstaller >= 6.10 的钩子，
+# 而 6.10 起 onefile 的进程级别追踪会破坏在线升级链路（见下方 pyinstaller 注释），
+# 因此整套锁定在兼容 PyInstaller 6.9.0 的组合上
+opencv-contrib-python-headless==4.10.0.84
+numpy==1.26.4
 imageio-ffmpeg>=0.5
 pywin32>=306  # 仅安装程序创建快捷方式需要
 
 # 打包依赖（仅构建 exe 时需要）
-pyinstaller>=6.0
+# 锁定 6.9.0：6.10 起 onefile 引入 _PYI_PARENT_PROCESS_LEVEL 进程级别追踪，
+# 6.22.1 起又加父进程安全校验，经 bat/安装器等中间进程
+# 启动时（在线升级链路）会被误判为子进程导致卡死或报错
+pyinstaller==6.9.0

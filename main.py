@@ -29,7 +29,8 @@ import tempfile
 import threading
 import urllib.request
 
-from version import APP_NAME, APP_VERSION, UPDATE_REPO
+from version import (APP_NAME, APP_VERSION, UPDATE_REPO,
+                    scrub_bootloader_env)
 from wm_core import (apply_region, build_encode_cmd, clamp_rect, norm_keys,
                      open_capture, rect_at, region_active)
 
@@ -407,6 +408,13 @@ def build_update_bat(setup_path, instdir, app_exe):
     bat = os.path.join(tempfile.gettempdir(), "videotools_update.bat")
     lines = [
         "@echo off",
+        # 清除本程序（onefile）残留在环境块里的 _PYI* 变量：
+        # 否则经本脚本启动的新版本会被 PyInstaller >= 6.22.1 的
+        # 安全校验误判为「父程序派生的子进程」而拒绝启动
+        'set "_PYI_ARCHIVE_FILE="',
+        'set "_PYI_PARENT_PROCESS_LEVEL="',
+        'set "_PYI_APPLICATION_HOME_DIR="',
+        'set "_PYI_SPLASH_IPC="',
         "ping 127.0.0.1 -n 4 >nul",
         f'"{setup_path}" /S /D="{instdir}"',
         f'start "" "{app_exe}"',
@@ -2230,8 +2238,11 @@ def gui_main():
 
             def job():
                 try:
+                    # 进度只写共享字典，由主线程轮询更新界面；
+                    # 工作线程直接调用 dlg.setValue 属跨线程操作 Qt，
+                    # 下载到 100% 触发对话框自动关闭时会卡死
                     download_file(asset["browser_download_url"], dst,
-                                  progress_cb=lambda p: dlg.setValue(p),
+                                  progress_cb=lambda p: result.update(p=p),
                                   cancel=cancel_ev)
                     result["ok"] = True
                 except Exception as e:
@@ -2240,8 +2251,10 @@ def gui_main():
             th = threading.Thread(target=job, daemon=True)
             th.start()
             while th.is_alive():
+                dlg.setValue(result.get("p", 0))
                 QApplication.processEvents()
                 th.join(0.05)
+            dlg.setValue(result.get("p", 0))
             dlg.close()
             if not result.get("ok"):
                 if result.get("err") != "已取消":
@@ -2296,6 +2309,7 @@ def gui_main():
 # ---------------------------------------------------------------------------
 
 def main():
+    scrub_bootloader_env()
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--cli", action="store_true", help="命令行模式（无界面）")
     parser.add_argument("--input", help="输入视频路径")

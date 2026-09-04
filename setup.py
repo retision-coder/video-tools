@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 
-from version import APP_NAME, APP_VERSION
+from version import APP_NAME, APP_VERSION, scrub_bootloader_env
 
 APP_EXE = "视频水印擦除工具.exe"
 UNINST_EXE = "卸载.exe"
@@ -353,6 +353,9 @@ def _crash_log(exe_dir):
 
 
 def main():
+    # 安装程序可能由升级脚本（经 cmd/bat 中间进程）拉起，入口先清理
+    # onefile 引导环境变量，避免污染后续拉起的子进程
+    scrub_bootloader_env()
     argv = sys.argv
     silent, instdir = parse_silent(argv)
     exe_dir = os.path.dirname(os.path.abspath(
