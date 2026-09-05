@@ -132,3 +132,26 @@ def open_capture(path):
         return cap, fps, w, h, total
     except Exception:
         return None
+
+
+def write_preview_frames(preview_dir, src, dst, max_w=640):
+    """把源帧/处理帧缩略成 JPEG 写入预览目录（src.jpg / dst.jpg）。
+
+    供处理界面定时轮询显示「原视频 vs 处理后」实时对比。
+    先写临时文件再改名，避免界面读到写了一半的图；任何失败静默忽略，
+    预览不能影响处理主流程。
+    """
+    import os
+    import cv2
+    try:
+        os.makedirs(preview_dir, exist_ok=True)
+        for name, fr in (("src", src), ("dst", dst)):
+            h, w = fr.shape[:2]
+            if w > max_w:
+                fr = cv2.resize(fr, (max_w, int(h * max_w / w)),
+                                interpolation=cv2.INTER_AREA)
+            tmp = os.path.join(preview_dir, name + "_tmp.jpg")  # 后缀决定编码格式
+            if cv2.imwrite(tmp, fr, [cv2.IMWRITE_JPEG_QUALITY, 70]):
+                os.replace(tmp, os.path.join(preview_dir, name + ".jpg"))
+    except Exception:
+        pass

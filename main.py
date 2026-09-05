@@ -27,12 +27,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 
 from version import (APP_NAME, APP_VERSION, UPDATE_REPO,
                     scrub_bootloader_env)
 from wm_core import (apply_region, build_encode_cmd, clamp_rect, norm_keys,
-                     open_capture, rect_at, region_active)
+                     open_capture, rect_at, region_active,
+                     write_preview_frames)
 
 # 在线升级：GitHub Releases API（可用环境变量覆盖，便于测试）
 UPDATE_API = (os.environ.get("WATERMARK_UPDATE_API")
@@ -215,10 +217,12 @@ def probe_size(path):
 # 逐帧处理引擎（区域关键帧模型见 wm_core.py，与 AI 引擎共享）
 # ---------------------------------------------------------------------------
 
-def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None):
+def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None,
+                  preview_dir=None):
     """
     逐帧处理视频。regions: [{'mode','keys':[(t,(x,y,w,h)),...]}, ...]
-    返回 (ok, message)。
+    preview_dir 不为空时，每 ~0.15s 写出一对源帧/处理帧缩略图，
+    供处理界面显示实时对比预览。返回 (ok, message)。
     """
     if not regions:
         return False, "没有有效的水印区域"
@@ -251,6 +255,7 @@ def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None):
 
     idx = 0
     err = None
+    last_pv = 0.0  # 上次写预览图的时间戳
     try:
         while True:
             if cancel is not None and cancel.is_set():
@@ -260,10 +265,19 @@ def process_video(ffmpeg, inp, outp, regions, progress_cb=None, cancel=None):
             if not ok:
                 break
             t = idx / fps
+            # 到预览时刻时先留一份源帧（apply_region 是原地修改）
+            src_frame = None
+            if preview_dir:
+                now = time.monotonic()
+                if now - last_pv >= 0.15:
+                    src_frame = frame.copy()
+                    last_pv = now
             for reg in regions:
                 if region_active(reg, t):
                     frame = apply_region(frame, reg["mode"],
                                          *rect_at(reg, t))
+            if src_frame is not None:
+                write_preview_frames(preview_dir, src_frame, frame)
             proc.stdin.write(frame.tobytes())
             idx += 1
             if progress_cb and total > 0 and idx % 5 == 0:
@@ -542,8 +556,10 @@ def engine_script():
 
 
 def process_video_ai(ffmpeg, inp, outp, regions,
-                     progress_cb=None, cancel=None, status_cb=None):
-    """用 AI 组件环境逐帧处理（含 LaMa 精修）。返回 (ok, msg)。"""
+                     progress_cb=None, cancel=None, status_cb=None,
+                     preview_dir=None):
+    """用 AI 组件环境逐帧处理（含 LaMa 精修）。返回 (ok, msg)。
+    preview_dir 不为空时透传给 AI 引擎，由它定时写预览对比图。"""
     py = ai_python()
     if not py:
         return False, "AI 组件未安装"
@@ -553,6 +569,8 @@ def process_video_ai(ffmpeg, inp, outp, regions,
             json.dump(regions, f)
         cmd = [py, engine_script(), "--input", inp, "--output", outp,
                "--regions", rj, "--ffmpeg", ffmpeg]
+        if preview_dir:
+            cmd += ["--preview-dir", preview_dir]
         # PyInstaller onefile 会把 _MEIPASS 注入 PATH，子进程（AI venv 的
         # python 3.11）会因此误加载打包版自带的 python312.dll 等 DLL 而崩溃。
         # 直接给子进程换成最小安全 PATH。
@@ -621,14 +639,16 @@ def has_ai_region(regions):
 
 
 def process_video_auto(ffmpeg, inp, outp, regions,
-                       progress_cb=None, cancel=None, status_cb=None):
+                       progress_cb=None, cancel=None, status_cb=None,
+                       preview_dir=None):
     """按区域模式自动路由：含 AI 精修时走 LaMa 引擎，否则走本地快速算法。"""
     if has_ai_region(regions):
         return process_video_ai(ffmpeg, inp, outp, regions,
                                 progress_cb=progress_cb, cancel=cancel,
-                                status_cb=status_cb)
+                                status_cb=status_cb, preview_dir=preview_dir)
     return process_video(ffmpeg, inp, outp, regions,
-                         progress_cb=progress_cb, cancel=cancel)
+                         progress_cb=progress_cb, cancel=cancel,
+                         preview_dir=preview_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -694,12 +714,12 @@ def cli_main(args):
 def gui_main():
     from PyQt5.QtCore import (QPoint, QRect, QSize, Qt, QThread, QTimer,
                               pyqtSignal)
-    from PyQt5.QtGui import QImage, QPainter, QPen, QColor
+    from PyQt5.QtGui import QImage, QPainter, QPen, QColor, QPixmap
     from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog,
                                  QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                  QLineEdit, QListWidget, QMainWindow,
                                  QMessageBox, QProgressBar, QProgressDialog,
-                                 QPushButton,
+                                 QPushButton, QStackedWidget,
                                  QSlider, QSplitter, QVBoxLayout, QWidget)
 
     HANDLE = 8  # 角手柄命中半径（控件像素）
@@ -931,21 +951,58 @@ def gui_main():
             else:
                 super().keyPressEvent(ev)
 
+    class CompareView(QWidget):
+        """处理过程实时对比视图：上「原视频」、下「处理后」，
+        由处理线程定时写出的缩略图驱动（见 _poll_preview），
+        画面进度与处理进度天然一致。尺寸与 PreviewLabel 一致（495×880）。"""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setFixedSize(495, 880)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(4)
+            self.panes = {}
+            for key, caption in (("src", "原视频"), ("dst", "处理后 · 实时")):
+                cap = QLabel(caption)
+                cap.setAlignment(Qt.AlignCenter)
+                cap.setStyleSheet("color:#aaa;font-size:12px;")
+                img = QLabel("等待处理开始…")
+                img.setAlignment(Qt.AlignCenter)
+                img.setFixedSize(495, 415)
+                img.setStyleSheet("background:#111;color:#666;")
+                v.addWidget(cap)
+                v.addWidget(img, 1)
+                self.panes[key] = img
+
+        def set_frame(self, key, pixmap):
+            """把一帧缩略图显示到 src/dst 窗格（等比缩放居中）。"""
+            lbl = self.panes[key]
+            lbl.setPixmap(pixmap.scaled(lbl.size(), Qt.KeepAspectRatio,
+                                        Qt.SmoothTransformation))
+
+        def clear(self):
+            for lbl in self.panes.values():
+                lbl.clear()
+                lbl.setText("等待处理开始…")
+
     class ProcessThread(QThread):
         progress = pyqtSignal(int)
         status = pyqtSignal(str)
         finished_ = pyqtSignal(bool, str)
 
-        def __init__(self, ffmpeg, inp, outp, regions):
+        def __init__(self, ffmpeg, inp, outp, regions, preview_dir=None):
             super().__init__()
             self.args = (ffmpeg, inp, outp, regions)
+            self.preview_dir = preview_dir
             self.cancel_ev = threading.Event()
 
         def run(self):
             ok, msg = process_video_auto(*self.args,
                                          progress_cb=self.progress.emit,
                                          cancel=self.cancel_ev,
-                                         status_cb=self.status.emit)
+                                         status_cb=self.status.emit,
+                                         preview_dir=self.preview_dir)
             self.finished_.emit(ok, msg)
 
     class BatchWorker(QThread):
@@ -1221,6 +1278,11 @@ def gui_main():
             self.aiSetupDone.connect(self._on_ai_setup_done)
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._play_tick)
+            # 处理过程实时对比：预览图目录 + 轮询定时器（处理中有效）
+            self._pv_dir = None
+            self._pv_mtimes = {}
+            self._pv_timer = QTimer(self)
+            self._pv_timer.timeout.connect(self._poll_preview)
             # 安装版启动 4 秒后在后台静默检查更新
             if getattr(sys, "frozen", False):
                 QTimer.singleShot(4000, self._auto_check)
@@ -1258,7 +1320,12 @@ def gui_main():
             left = QWidget()
             lv = QVBoxLayout(left)
             lv.setContentsMargins(6, 6, 6, 6)
-            lv.addWidget(self.preview, 1)
+            # 堆叠视图：页 0 = 框选预览，页 1 = 处理过程实时对比（原视频/处理后）
+            self.compare = CompareView()
+            self.stack = QStackedWidget()
+            self.stack.addWidget(self.preview)
+            self.stack.addWidget(self.compare)
+            lv.addWidget(self.stack, 1)
             trow = QHBoxLayout()
             trow.addWidget(self.btn_stop)
             trow.addWidget(self.btn_prev)
@@ -2037,7 +2104,14 @@ def gui_main():
                 self._begin_process(*pending)
 
         def _begin_process(self, regions, outp):
-            self.worker = ProcessThread(self.ffmpeg, self.video_path, outp, regions)
+            # 处理过程实时对比：预览图目录由处理线程定时写入，
+            # 界面用定时器轮询刷新；处理结束在 _on_done 中恢复框选预览
+            self._pv_dir = tempfile.mkdtemp(prefix="wme_pv_")
+            self._pv_mtimes = {}
+            self.compare.clear()
+            self.stack.setCurrentWidget(self.compare)
+            self.worker = ProcessThread(self.ffmpeg, self.video_path, outp,
+                                        regions, preview_dir=self._pv_dir)
             self.worker.progress.connect(self.progress.setValue)
             self.worker.status.connect(self.lbl_status.setText)
             self.worker.finished_.connect(self._on_done)
@@ -2049,7 +2123,25 @@ def gui_main():
             if has_ai_region(regions):
                 tip += "（AI 精修逐帧运行，速度较慢属正常）"
             self.lbl_status.setText(tip + "…")
+            self._pv_timer.start(150)
             self.worker.start()
+
+        def _poll_preview(self):
+            """轮询预览目录，把最新的源帧/处理帧缩略图刷到对比视图。"""
+            if not self._pv_dir:
+                return
+            for key in ("src", "dst"):
+                p = os.path.join(self._pv_dir, key + ".jpg")
+                try:
+                    mt = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if self._pv_mtimes.get(key) == mt:
+                    continue
+                pm = QPixmap(p)
+                if not pm.isNull():
+                    self.compare.set_frame(key, pm)
+                    self._pv_mtimes[key] = mt
 
         def open_batch(self):
             if not self.regions:
@@ -2279,6 +2371,12 @@ def gui_main():
 
         def _on_done(self, ok, msg):
             self._set_running(False)
+            # 停止对比预览轮询，恢复框选预览页，清理预览图目录
+            self._pv_timer.stop()
+            self.stack.setCurrentWidget(self.preview)
+            if self._pv_dir:
+                shutil.rmtree(self._pv_dir, ignore_errors=True)
+                self._pv_dir = None
             if ok:
                 self.progress.setValue(100)
                 self.lbl_status.setText(f"处理完成：{msg}")

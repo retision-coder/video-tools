@@ -13,9 +13,11 @@ import json
 import subprocess
 import sys
 import threading
+import time
 
 from wm_core import (apply_region, build_encode_cmd, clamp_rect,
-                     open_capture, rect_at, region_active)
+                     open_capture, rect_at, region_active,
+                     write_preview_frames)
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -26,6 +28,8 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--regions", required=True, help="区域 JSON 文件路径")
     ap.add_argument("--ffmpeg", required=True)
+    ap.add_argument("--preview-dir", default=None,
+                    help="预览对比图输出目录（src.jpg/dst.jpg，约每 0.5s 一对）")
     args = ap.parse_args()
 
     with open(args.regions, encoding="utf-8") as f:
@@ -70,12 +74,20 @@ def main():
     threading.Thread(target=read_stderr, daemon=True).start()
 
     idx = 0
+    last_pv = 0.0  # 上次写预览图的时间戳
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             t = idx / fps
+            # 到预览时刻时先留一份源帧（后续处理是原地修改）
+            src_frame = None
+            if args.preview_dir:
+                now = time.monotonic()
+                if now - last_pv >= 0.5:
+                    src_frame = frame.copy()
+                    last_pv = now
             ai_mask = None
             for reg in regions:
                 if not region_active(reg, t):
@@ -96,6 +108,8 @@ def main():
                 msk = Image.fromarray(ai_mask)
                 res = np.array(lama(img, msk))  # RGB
                 frame = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
+            if src_frame is not None:
+                write_preview_frames(args.preview_dir, src_frame, frame)
             proc.stdin.write(frame.tobytes())
             idx += 1
             if idx % 10 == 0:
