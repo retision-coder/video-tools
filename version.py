@@ -7,7 +7,7 @@ import os
 import sys
 
 APP_NAME = "视频水印擦除工具"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 
 # 在线升级：GitHub Releases 仓库
 UPDATE_REPO = "retision-coder/video-tools"
