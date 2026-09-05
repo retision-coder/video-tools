@@ -41,8 +41,31 @@ assert main.parse_version("") == (0, 0, 0)
 print("版本比较 OK")
 
 # ---- 启动 mock 服务器 ----
-handler = functools.partial(http.server.SimpleHTTPRequestHandler,
-                            directory=MOCK)
+FULL = open(os.path.join(MOCK, "视频水印擦除工具_Setup_v9.9.9.exe"), "rb").read()
+
+
+class FlakyHandler(http.server.SimpleHTTPRequestHandler):
+    """/flaky.exe 前两次请求模拟连接中断（只发一部分就断开）。"""
+    flaky_count = 0
+
+    def do_GET(self):
+        if self.path == "/flaky.exe":
+            FlakyHandler.flaky_count += 1
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(FULL)))
+            self.end_headers()
+            if FlakyHandler.flaky_count <= 2:
+                try:
+                    self.wfile.write(FULL[:50000])
+                finally:
+                    self.connection.close()  # 模拟中途断线
+                return
+            self.wfile.write(FULL)
+            return
+        super().do_GET()
+
+
+handler = functools.partial(FlakyHandler, directory=MOCK)
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -62,6 +85,24 @@ assert os.path.getsize(dst) == os.path.getsize(
     os.path.join(MOCK, "视频水印擦除工具_Setup_v9.9.9.exe"))
 assert pcts and pcts[-1] == 100
 print("下载 OK，进度回调", len(pcts), "次")
+
+# ---- 断线自动重试：download_asset 前两次连接中断，第三次成功 ----
+flaky_asset = {"browser_download_url": f"http://127.0.0.1:{PORT}/flaky.exe"}
+dst3 = os.path.join(MOCK, "dl3.exe")
+pcts3 = []
+main.download_asset(flaky_asset, dst3, progress_cb=pcts3.append)
+assert os.path.getsize(dst3) == len(FULL), "断线重试后文件大小不对"
+assert FlakyHandler.flaky_count == 3, f"应重试到第 3 次，实际 {FlakyHandler.flaky_count}"
+print(f"断线自动重试 OK（第 {FlakyHandler.flaky_count} 次成功）")
+
+# ---- 全部失败时的错误信息 ----
+bad_asset = {"browser_download_url": f"http://127.0.0.1:{PORT}/不存在.exe"}
+try:
+    main.download_asset(bad_asset, os.path.join(MOCK, "dl_bad.exe"))
+    raise AssertionError("下载不存在的文件应抛错")
+except RuntimeError as e:
+    assert "多次尝试" in str(e), str(e)
+print("失败错误信息 OK")
 
 # ---- 升级脚本 ----
 bat = main.build_update_bat(dst, r"C:\Users\a\AppData\Local\Programs\videotools",

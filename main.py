@@ -417,6 +417,76 @@ def download_file(url, dst, progress_cb=None, cancel=None):
     return dst
 
 
+def _download_once(url, dst, progress_cb, cancel, extra_headers=None):
+    """单地址下载一次，支持断点续传（本地已有部分内容时发 Range 请求）。
+    服务端不支持 Range（返回 200 而非 206）时自动从头重下。
+    返回最终文件大小。网络/HTTP 错误向上抛，由 download_asset 重试。"""
+    headers = {"User-Agent": "VideoWatermarkEraser-Updater"}
+    if extra_headers:
+        headers.update(extra_headers)
+    have = os.path.getsize(dst) if os.path.isfile(dst) else 0
+    if have > 0:
+        headers["Range"] = f"bytes={have}-"
+    req = urllib.request.Request(_quote_url(url), headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if r.status == 206:
+            mode = "ab"
+            total = have + int(r.headers.get("Content-Length") or 0)
+        else:
+            # 服务端忽略 Range 或不支持：从头下载
+            mode = "wb"
+            have = 0
+            total = int(r.headers.get("Content-Length") or 0)
+        done = have
+        with open(dst, mode) as f:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("已取消")
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb and total:
+                    progress_cb(min(99, int(done / total * 100)))
+    # 连接中途断开时 read 会返回空（看似正常结束），必须按声明长度校验，
+    # 否则截断的安装包会被当作下载成功
+    if total and done != total:
+        raise RuntimeError(f"连接中断（已下载 {done}/{total} 字节）")
+    if progress_cb:
+        progress_cb(100)
+    return done
+
+
+def download_asset(asset, dst, progress_cb=None, cancel=None):
+    """下载 Release 资产：页面下载地址与 API 地址互为备用（github.com 直连
+    在部分网络下不稳定，api.github.com 通常可用），失败自动断点续传重试，
+    最多 6 次。全部失败抛出带明细的 RuntimeError。"""
+    candidates = []
+    if asset.get("browser_download_url"):
+        candidates.append((asset["browser_download_url"], None))
+    if asset.get("url"):
+        candidates.append((asset["url"],
+                           {"Accept": "application/octet-stream"}))
+    if not candidates:
+        raise RuntimeError("资产没有可用的下载地址")
+    errors = []
+    for attempt in range(6):
+        url, extra = candidates[attempt % len(candidates)]
+        try:
+            return _download_once(url, dst, progress_cb, cancel, extra)
+        except Exception as e:
+            if str(e) == "已取消":
+                raise  # 用户取消不重试
+            errors.append(f"{type(e).__name__}: {e}")
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("已取消")
+            time.sleep(min(2 * (attempt + 1), 8))
+    raise RuntimeError(
+        "多次尝试均失败（github.com 连接不稳定，建议换个网络环境或稍后再试）：\n"
+        + "\n".join(errors[-3:]))
+
+
 def build_update_bat(setup_path, instdir, app_exe):
     """生成升级脚本：等本程序退出 → 静默覆盖安装 → 启动新版 → 清理。"""
     bat = os.path.join(tempfile.gettempdir(), "videotools_update.bat")
@@ -2232,8 +2302,8 @@ def gui_main():
 
             def job():
                 try:
-                    download_file(asset["browser_download_url"], dst,
-                                  progress_cb=self.dlProgress.emit)
+                    download_asset(asset, dst,
+                                   progress_cb=self.dlProgress.emit)
                     self.dlDone.emit(dst, None)
                 except Exception as e:
                     self.dlDone.emit("", str(e))
@@ -2347,9 +2417,9 @@ def gui_main():
                     # 进度只写共享字典，由主线程轮询更新界面；
                     # 工作线程直接调用 dlg.setValue 属跨线程操作 Qt，
                     # 下载到 100% 触发对话框自动关闭时会卡死
-                    download_file(asset["browser_download_url"], dst,
-                                  progress_cb=lambda p: result.update(p=p),
-                                  cancel=cancel_ev)
+                    download_asset(asset, dst,
+                                   progress_cb=lambda p: result.update(p=p),
+                                   cancel=cancel_ev)
                     result["ok"] = True
                 except Exception as e:
                     result["err"] = str(e)
