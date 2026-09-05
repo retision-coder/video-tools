@@ -83,6 +83,21 @@ def apply_region(frame, mode, x, y, w, h):
         mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=2)
         # Navier-Stokes 修复：大块区域融合比 Telea 更平滑
         res = cv2.inpaint(roi, mask, 7, cv2.INPAINT_NS)
+        # 噪点匹配：扩散修复会把区域抹平，在带颗粒的画面上形成显眼的
+        # 「光滑补丁」。从掩码外圈环形区估计噪点强度，给修复区补回匹配
+        # 颗粒；画面本身干净时强度≈0，自动不产生噪点
+        ring = cv2.subtract(cv2.dilate(mask, np.ones((15, 15), np.uint8)), mask)
+        if ring.any():
+            ring_px = roi[ring > 0].astype(np.float32)
+            blur_px = cv2.GaussianBlur(roi, (0, 0), 3)[ring > 0].astype(np.float32)
+            std = float(np.std(ring_px - blur_px))
+            if std > 2.0:
+                noise = np.random.default_rng().normal(
+                    0, std, res.shape).astype(np.float32)
+                m3 = (mask > 0)[..., None]
+                res = np.where(
+                    m3, np.clip(res.astype(np.float32) + noise, 0, 255),
+                    res.astype(np.float32)).astype(np.uint8)
         # 接缝羽化：软掩码混合，消除修复区与周边的边界痕
         soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 4)[..., None]
         frame[y0:y1, x0:x1] = (

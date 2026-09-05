@@ -104,10 +104,33 @@ def main():
                 # 掩码外扩，交给 LaMa 一起修复（比逐框更连贯）
                 ai_mask = cv2.dilate(ai_mask, np.ones((9, 9), np.uint8),
                                      iterations=2)
-                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                msk = Image.fromarray(ai_mask)
-                res = np.array(lama(img, msk))  # RGB
-                frame = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
+                # 只把「水印包围盒 + 边缘余量」的小块送进 LaMa：
+                # 与整帧相比面积通常小 10~30 倍，CPU 上同比例提速而效果不变
+                bx, by, bw, bh = cv2.boundingRect(ai_mask)
+                m = 48
+                px0, py0 = max(0, bx - m), max(0, by - m)
+                px1, py1 = min(W, bx + bw + m), min(H, by + bh + m)
+                if (px1 - px0) * (py1 - py0) < W * H * 0.6:
+                    patch = frame[py0:py1, px0:px1]
+                    pmask = ai_mask[py0:py1, px0:px1]
+                    img = Image.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
+                    res = np.array(lama(img, Image.fromarray(pmask)))  # RGB
+                    res = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
+                    # LaMa 内部按 8 对齐，返回尺寸可能与输入差几个像素，统一回小块尺寸
+                    if res.shape[:2] != patch.shape[:2]:
+                        res = cv2.resize(res, (patch.shape[1], patch.shape[0]))
+                    # 软掩码贴回，消除补丁边缘
+                    soft = cv2.GaussianBlur(
+                        pmask.astype(np.float32) / 255.0, (0, 0), 4)[..., None]
+                    frame[py0:py1, px0:px1] = (
+                        res.astype(np.float32) * soft
+                        + patch.astype(np.float32) * (1 - soft)).astype(np.uint8)
+                else:
+                    # 水印区域过大时退回整帧修复
+                    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    msk = Image.fromarray(ai_mask)
+                    res = np.array(lama(img, msk))  # RGB
+                    frame = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
             if src_frame is not None:
                 write_preview_frames(args.preview_dir, src_frame, frame)
             proc.stdin.write(frame.tobytes())
