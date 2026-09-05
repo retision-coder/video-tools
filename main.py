@@ -1606,9 +1606,6 @@ def gui_main():
             if not ok or not name.strip():
                 return
             name = name.strip()
-            if name in existing:
-                QMessageBox.warning(self, APP_NAME, "已存在同名方案")
-                return
             regions = []
             for r in self.regions:
                 regions.append({
@@ -1617,8 +1614,16 @@ def gui_main():
                               [int(round(v)) for v in k[1]]]
                              for k in norm_keys(r)],
                 })
-            self.schemes.append({"name": name, "vw": self.vw, "vh": self.vh,
-                                 "regions": regions})
+            # 同名方案直接覆盖更新（修改后重新保存的场景）；新名字则追加
+            overwritten = False
+            for s in self.schemes:
+                if s["name"] == name:
+                    s["vw"], s["vh"], s["regions"] = self.vw, self.vh, regions
+                    overwritten = True
+                    break
+            if not overwritten:
+                self.schemes.append({"name": name, "vw": self.vw, "vh": self.vh,
+                                     "regions": regions})
             try:
                 save_schemes(self.schemes)
             except Exception as e:
@@ -1626,7 +1631,8 @@ def gui_main():
                 return
             self._refresh_schemes(select_name=name)
             self.lbl_status.setText(
-                f"方案「{name}」已保存（{len(regions)} 个框）")
+                f"方案「{name}」已{'覆盖更新' if overwritten else '保存'}"
+                f"（{len(regions)} 个框）")
 
         def _on_scheme_pick(self, idx):
             if idx <= 0:

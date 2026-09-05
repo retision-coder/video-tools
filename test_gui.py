@@ -48,12 +48,21 @@ def patched_exec():
             print("schemes:", [s["name"] for s in w.schemes])
             assert any(s["name"] == "测试方案A" for s in w.schemes)
             assert os.path.exists(SCHEME_FILE)
+            # --- 修改后同名保存：应覆盖而不是报错/重复 ---
+            w.cmb_preset.activated.emit(3)  # 再加一个框（右下角）
+            assert len(w.regions) == 2
+            n_before = len(w.schemes)
+            w._save_scheme()  # mock 输入仍是「测试方案A」
+            assert len(w.schemes) == n_before, "同名保存不应新增方案"
+            saved = [s for s in w.schemes if s["name"] == "测试方案A"][0]
+            assert len(saved["regions"]) == 2, "同名保存未覆盖内容"
+            print("ok: 同名方案覆盖保存")
             # --- 清空后套用 ---
             w._clear_all()
             assert len(w.regions) == 0
             w.cmb_scheme.activated.emit(1)
             print("after apply:", w.regions)
-            assert len(w.regions) == 1 and w.regions[0]["mode"] == "inpaint"
+            assert len(w.regions) == 2 and w.regions[0]["mode"] == "inpaint"
             # --- 分辨率缩放 ---
             scaled = main.scale_regions(
                 [{"mode": "inpaint", "r0": (100, 50, 200, 60),
