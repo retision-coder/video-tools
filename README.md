@@ -27,6 +27,12 @@
 
 ### 发布新版本（维护者）
 
+> **发布纪律（项目规则）**：功能改动只改代码 + 本地测试，**不升版本号、不发 Release**；
+> 多个小改动攒在一起，由项目所有者明确说「发布」时，才统一升版本、打包、推送、
+> 发 Release。避免改一个小功能就发一个版本。
+
+发布步骤（仅在收到明确「发布」指令后执行）：
+
 1. 只需改 `version.py` 里的 `APP_VERSION`（版本号单一来源，安装程序与版本资源自动同步），
    重跑 `build.py` + `build_installer.py`
 2. 到 GitHub 仓库 [retision-coder/video-tools](https://github.com/retision-coder/video-tools)
