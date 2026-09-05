@@ -952,27 +952,33 @@ def gui_main():
                 super().keyPressEvent(ev)
 
     class CompareView(QWidget):
-        """处理过程实时对比视图：上「原视频」、下「处理后」，
+        """处理过程实时对比视图：左「原视频」、右「处理后」并排，
         由处理线程定时写出的缩略图驱动（见 _poll_preview），
-        画面进度与处理进度天然一致。尺寸与 PreviewLabel 一致（495×880）。"""
+        画面进度与处理进度天然一致。
+        比框选预览宽（960×880），处理开始时主窗口左边栏自动加宽容纳，
+        处理结束恢复原宽（见 _begin_process / _on_done）。"""
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setFixedSize(495, 880)
-            v = QVBoxLayout(self)
-            v.setContentsMargins(0, 0, 0, 0)
-            v.setSpacing(4)
+            self.setFixedSize(960, 880)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
             self.panes = {}
             for key, caption in (("src", "原视频"), ("dst", "处理后 · 实时")):
+                col = QVBoxLayout()
+                col.setContentsMargins(0, 0, 0, 0)
+                col.setSpacing(4)
                 cap = QLabel(caption)
                 cap.setAlignment(Qt.AlignCenter)
                 cap.setStyleSheet("color:#aaa;font-size:12px;")
                 img = QLabel("等待处理开始…")
                 img.setAlignment(Qt.AlignCenter)
-                img.setFixedSize(495, 415)
+                img.setFixedSize(477, 840)
                 img.setStyleSheet("background:#111;color:#666;")
-                v.addWidget(cap)
-                v.addWidget(img, 1)
+                col.addWidget(cap)
+                col.addWidget(img, 1)
+                h.addLayout(col)
                 self.panes[key] = img
 
         def set_frame(self, key, pixmap):
@@ -1283,6 +1289,7 @@ def gui_main():
             self._pv_mtimes = {}
             self._pv_timer = QTimer(self)
             self._pv_timer.timeout.connect(self._poll_preview)
+            self._normal_size = None  # 处理前的窗口尺寸（对比页更宽，结束恢复）
             # 安装版启动 4 秒后在后台静默检查更新
             if getattr(sys, "frozen", False):
                 QTimer.singleShot(4000, self._auto_check)
@@ -1320,11 +1327,11 @@ def gui_main():
             left = QWidget()
             lv = QVBoxLayout(left)
             lv.setContentsMargins(6, 6, 6, 6)
-            # 堆叠视图：页 0 = 框选预览，页 1 = 处理过程实时对比（原视频/处理后）
+            # 堆叠视图：页 0 = 框选预览；处理过程实时对比页（更宽）在处理
+            # 开始时才加入并切换，同时加宽窗口（见 _begin_process）
             self.compare = CompareView()
             self.stack = QStackedWidget()
             self.stack.addWidget(self.preview)
-            self.stack.addWidget(self.compare)
             lv.addWidget(self.stack, 1)
             trow = QHBoxLayout()
             trow.addWidget(self.btn_stop)
@@ -2109,7 +2116,14 @@ def gui_main():
             self._pv_dir = tempfile.mkdtemp(prefix="wme_pv_")
             self._pv_mtimes = {}
             self.compare.clear()
+            if self.stack.indexOf(self.compare) < 0:
+                self.stack.addWidget(self.compare)
             self.stack.setCurrentWidget(self.compare)
+            # 对比页比框选预览宽，左边栏（窗口）临时加宽容纳，处理完恢复
+            self._normal_size = self.size()
+            dw = self.compare.width() - self.preview.width()
+            if dw > 0:
+                self.setFixedSize(self.width() + dw, self.height())
             self.worker = ProcessThread(self.ffmpeg, self.video_path, outp,
                                         regions, preview_dir=self._pv_dir)
             self.worker.progress.connect(self.progress.setValue)
@@ -2371,9 +2385,12 @@ def gui_main():
 
         def _on_done(self, ok, msg):
             self._set_running(False)
-            # 停止对比预览轮询，恢复框选预览页，清理预览图目录
+            # 停止对比预览轮询，恢复框选预览页与窗口原宽，清理预览图目录
             self._pv_timer.stop()
             self.stack.setCurrentWidget(self.preview)
+            if getattr(self, "_normal_size", None) is not None:
+                self.setFixedSize(self._normal_size)
+                self._normal_size = None
             if self._pv_dir:
                 shutil.rmtree(self._pv_dir, ignore_errors=True)
                 self._pv_dir = None

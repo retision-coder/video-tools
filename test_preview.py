@@ -71,9 +71,11 @@ def test_gui_compare_view():
                                 "keys": [(0.0, (455.0, 10.0, 180.0, 50.0))]}]
                     outp = os.path.join(tempfile.gettempdir(),
                                         "wme_pv_gui_out.mp4")
+                    normal_w = w.width()
                     w._begin_process(regions, outp)
-                    # 处理中：应切到对比视图页
+                    # 处理中：应切到对比视图页，且左边栏（窗口）加宽
                     assert w.stack.currentWidget() is w.compare, "未切到对比视图"
+                    assert w.width() > normal_w, "窗口未加宽容纳左右对比"
                     assert w._pv_dir and os.path.isdir(w._pv_dir), "预览目录未建"
                     assert w._pv_timer.isActive(), "预览轮询未启动"
                     # 等待处理完成（事件循环持续泵送，轮询定时器会刷新对比图）
@@ -86,11 +88,12 @@ def test_gui_compare_view():
                             got_frames = True
                     assert got_frames, "对比视图未收到任何实时帧"
                     assert w.worker is None, "处理超时未结束"
-                    # 结束后：恢复框选预览页、轮询停止、目录清理
+                    # 结束后：恢复框选预览页与窗口原宽、轮询停止、目录清理
                     assert w.stack.currentWidget() is w.preview, "未恢复预览页"
+                    assert w.width() == normal_w, "窗口未恢复原宽"
                     assert not w._pv_timer.isActive(), "轮询未停止"
                     assert w._pv_dir is None, "预览目录未清理"
-                    print("ok: 对比视图实时刷新 → 结束后恢复框选预览")
+                    print("ok: 左右对比实时刷新 + 窗口加宽/恢复 → 结束后恢复框选预览")
                 except Exception:
                     import traceback
                     traceback.print_exc()
